@@ -597,10 +597,28 @@ read -r -p "Type YES after verifying the checksum: " CONFIRM2
 
 info "[3/4] Extracting CHR RAW image..."
 
-gunzip -k -c "$CHR_FILE" > "${WORKDIR}/chr.img" \
-    || fail "Failed to extract CHR RAW image."
+#
+# FIX: the downloaded archive is a ZIP file (verified above with `file`
+# and `unzip -t`), not a gzip stream. The previous version of this script
+# incorrectly called `gunzip` here, which always failed on a ZIP file and
+# aborted the installer before it could ever reach the disk-write step.
+#
+# We now extract with `unzip`, find the single .img member inside the
+# archive (MikroTik ships exactly one RAW image per release), and verify
+# it explicitly instead of assuming a fixed filename.
+#
 
 IMAGE="${WORKDIR}/chr.img"
+
+IMAGE_MEMBER="$(
+    unzip -Z1 "$CHR_FILE" 2>/dev/null | grep -i '\.img$' | head -n1
+)"
+
+[[ -n "$IMAGE_MEMBER" ]] \
+    || fail "Could not find a .img file inside the downloaded ZIP archive."
+
+unzip -p "$CHR_FILE" "$IMAGE_MEMBER" > "$IMAGE" \
+    || fail "Failed to extract CHR RAW image from ZIP archive."
 
 [[ -s "$IMAGE" ]] \
     || fail "Extracted CHR image is empty."
