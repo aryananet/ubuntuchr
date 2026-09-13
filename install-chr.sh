@@ -344,10 +344,29 @@ DISK_TYPE="$(lsblk -ndo TYPE "$DISK" 2>/dev/null || true)"
     || fail "Resolved target '$DISK' is not a whole disk (detected type: '$DISK_TYPE')."
 
 # Do not write to removable devices.
+#
+# NOTE: lsblk's RM flag reflects /sys/block/<dev>/removable. On several
+# KVM/QEMU virtio-blk setups this is reported as "1" for perfectly normal
+# virtual system disks (this is a known virtio quirk, not an indication
+# of a USB stick or SD card). Rejecting on RM alone therefore produces
+# false positives on exactly the kind of VPS this installer targets.
+#
+# Instead: only abort if the device's actual bus path shows it is
+# attached via USB. A virtio/paravirtual disk that merely reports
+# removable=1 is allowed to proceed.
+#
 RM_FLAG="$(lsblk -ndo RM "$DISK" 2>/dev/null || echo 1)"
 
-[[ "$RM_FLAG" == "0" ]] \
-    || fail "Target disk '$DISK' is marked removable. Refusing destructive operation."
+if [[ "$RM_FLAG" != "0" ]]; then
+    DISK_NAME="$(basename "$DISK")"
+    DEVICE_BUS_PATH="$(readlink -f "/sys/block/${DISK_NAME}/device" 2>/dev/null || true)"
+
+    if [[ "$DEVICE_BUS_PATH" == *"/usb"* ]]; then
+        fail "Target disk '$DISK' is attached via USB and marked removable. Refusing destructive operation."
+    else
+        warn "Target disk '$DISK' reports removable=1, but is not a USB device (common false positive on ${VIRT_TYPE} virtio disks). Continuing."
+    fi
+fi
 
 # The disk must actually contain the root filesystem somewhere in its tree.
 ROOT_RELATION=0
