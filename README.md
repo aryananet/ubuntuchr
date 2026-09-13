@@ -4,8 +4,6 @@ Automatically converts a supported Ubuntu VPS into MikroTik Cloud Hosted Router 
 
 ## ⚠️ WARNING
 
-This installer is DESTRUCTIVE.
-
 It permanently erases the current system disk and replaces Ubuntu with MikroTik CHR.
 
 All files, partitions, operating system data and other data stored on the target disk will be destroyed.
