@@ -1,0 +1,12 @@
+
+### 2. `LICENSE`
+
+برای پروژه عمومی، یک License هم بگذار.
+
+مثلاً **MIT License** ساده‌ترین گزینه است.
+
+از GitHub هنگام ساخت فایل `LICENSE` می‌توانی گزینه:
+
+```text
+Choose a license template
+→ MIT License
