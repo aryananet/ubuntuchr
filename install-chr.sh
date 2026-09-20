@@ -96,6 +96,28 @@ case "${1:-}" in
 esac
 
 # ============================================================================
+# Interactive input helper
+# ============================================================================
+#
+# IMPORTANT: the installer is commonly started like this:
+#
+#   curl -fsSL .../install-chr.sh | sudo bash
+#
+# In that case bash receives the script itself from stdin. A normal `read`
+# therefore reads EOF from the curl pipe instead of reading the user's answer
+# from the terminal, which caused the installer to cancel immediately.
+# All interactive confirmations must explicitly read from /dev/tty.
+#
+read_tty() {
+    local prompt_text="$1"
+    local variable_name="$2"
+
+    [[ -e /dev/tty ]] || fail "Interactive terminal '/dev/tty' is unavailable."
+
+    read -r -p "$prompt_text" "$variable_name" </dev/tty
+}
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
@@ -581,7 +603,7 @@ else
     echo -e "${RED}This operation cannot be undone.${NC}"
     echo
 
-    read -r -p "Type YES to continue: " CONFIRM
+    read_tty "Type YES to continue: " CONFIRM
 
     [[ "$CONFIRM" == "YES" ]] || {
         echo -e "${YELLOW}Installation cancelled. The current system was not modified.${NC}"
@@ -652,7 +674,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo -e "${CYAN}CHECK-ONLY mode: checksum is shown above; continuing without disk write.${NC}"
     echo
 else
-    read -r -p "Type YES after verifying the checksum: " CONFIRM2
+    read_tty "Type YES after verifying the checksum: " CONFIRM2
 
     [[ "$CONFIRM2" == "YES" ]] || {
         echo -e "${YELLOW}Installation cancelled. No disk write was performed.${NC}"
@@ -887,7 +909,7 @@ echo -e "${RED}The next command will overwrite ${DISK}.${NC}"
 echo -e "${RED}Ubuntu will be destroyed permanently.${NC}"
 echo
 
-read -r -p "Type INSTALL to start writing CHR: " FINAL_CONFIRM
+read_tty "Type INSTALL to start writing CHR: " FINAL_CONFIRM
 
 [[ "$FINAL_CONFIRM" == "INSTALL" ]] || {
     echo -e "${YELLOW}Installation cancelled. No destructive write was performed.${NC}"
@@ -971,7 +993,7 @@ echo
 echo -e "${GREEN}Installation completed successfully.${NC}"
 echo
 
-read -r -p "Press ENTER to reboot the VPS..." _
+read_tty "Press ENTER to reboot the VPS..." _
 
 sync
 sleep 2
