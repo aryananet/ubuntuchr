@@ -21,9 +21,16 @@ umask 077
 # ============================================================================
 
 CHR_VERSION="7.23.5"
-CHR_FILE="chr-${CHR_VERSION}.img.zip"
+
+# Default to the Legacy BIOS image so CHR_FILE/CHR_URL are always defined
+# for cleanup/error handling even if the script aborts before boot-mode detection.
+CHR_FILE="chr-${CHR_VERSION}-legacy-bios.img.zip"
 CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
 CHR_INFO_URL="https://mikrotik.com/download/chr"
+
+# MikroTik publishes separate official x86 CHR RAW images for UEFI and Legacy BIOS.
+# UEFI   -> chr-${CHR_VERSION}.img.zip
+# Legacy -> chr-${CHR_VERSION}-legacy-bios.img.zip
 
 SUPPORTED_UBUNTU_VERSIONS=("20.04" "22.04" "24.04" "26.04")
 
@@ -197,10 +204,18 @@ info "Virtualization: ${VIRT_TYPE} — OK"
 # ============================================================================
 
 if [[ -d /sys/firmware/efi ]]; then
-    fail "This VPS is currently booted in UEFI mode. The selected CHR RAW image must be booted using legacy BIOS/CSM mode."
+    BOOT_MODE="UEFI"
+    CHR_FILE="chr-${CHR_VERSION}.img.zip"
+    CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
+    info "Boot mode: UEFI — OK"
+    info "CHR image: UEFI RAW image — OK"
+else
+    BOOT_MODE="Legacy BIOS"
+    CHR_FILE="chr-${CHR_VERSION}-legacy-bios.img.zip"
+    CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
+    info "Boot mode: Legacy BIOS — OK"
+    info "CHR image: Legacy BIOS RAW image — OK"
 fi
-
-info "Boot mode: legacy BIOS — OK"
 
 # ============================================================================
 # 5. Update Ubuntu and install prerequisites
@@ -514,7 +529,8 @@ echo
 echo -e "${WHITE}Ubuntu             : ${GREEN}${VERSION_ID}${NC}"
 echo -e "${WHITE}Architecture       : ${GREEN}${ARCH}${NC}"
 echo -e "${WHITE}Virtualization     : ${GREEN}${VIRT_TYPE}${NC}"
-echo -e "${WHITE}Boot mode          : ${GREEN}Legacy BIOS${NC}"
+echo -e "${WHITE}Boot mode          : ${GREEN}${BOOT_MODE}${NC}"
+echo -e "${WHITE}CHR Image          : ${GREEN}${CHR_FILE}${NC}"
 echo -e "${WHITE}Network Interface  : ${GREEN}${INTERFACE}${NC}"
 echo -e "${WHITE}IPv4               : ${GREEN}${IPV4}/${PREFIX}${NC}"
 echo -e "${WHITE}Gateway            : ${GREEN}${GATEWAY}${NC}"
@@ -614,7 +630,7 @@ read -r -p "Type YES after verifying the checksum: " CONFIRM2
 # 16. Extract RAW image
 # ============================================================================
 
-info "[3/4] Extracting CHR RAW image..."
+info "[3/4] Extracting ${BOOT_MODE} MikroTik CHR RAW image..."
 
 #
 # FIX: the downloaded archive is a ZIP file (verified above with `file`
