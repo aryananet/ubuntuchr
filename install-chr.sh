@@ -713,9 +713,8 @@ info "CHR RAW image size: ${IMAGE_SIZE_MB} MiB"
 # This intentionally follows the "no-gdisk" style conversion documented by
 # the fat-chr project: preserve partition 1 files, format partition 1 as FAT,
 # restore the files, and keep the existing partition table unchanged.
-# The existing CHR partition 1 is already identified as an EFI System
-# Partition by GPT; changing only the filesystem avoids unnecessary partition
-# table surgery on the live installer path.
+# The existing CHR partition layout is intentionally preserved; only the
+# filesystem on partition 1 is converted to FAT16 for UEFI compatibility.
 #
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     info "Preparing CHR image for UEFI boot..."
@@ -752,13 +751,28 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     EFI_PARTTYPE="$(blkid -o value -s PART_ENTRY_TYPE "$EFI_PART" 2>/dev/null || true)"
 
     info "Original CHR boot partition filesystem: ${EFI_FSTYPE:-unknown}"
-    info "CHR boot partition type: ${EFI_PARTTYPE:-unknown}"
+    info "CHR boot partition GPT type: ${EFI_PARTTYPE:-unavailable}"
 
-    # The CHR boot partition is expected to be an EFI System Partition in GPT.
-    # Keep the existing partition table unchanged; only the filesystem is
-    # converted to FAT16 below.
-    [[ "${EFI_PARTTYPE,,}" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] \
-        || fail "UEFI preparation refused: CHR partition 1 is not an EFI System Partition."
+    # IMPORTANT:
+    # CHR x86 uses a hybrid GPT/MBR layout. On some kernel/NBD combinations
+    # blkid cannot expose PART_ENTRY_TYPE for the attached raw image and returns
+    # an empty value. An unavailable GPT type is therefore NOT treated as an
+    # error. If a GPT type is available and explicitly wrong, we still abort.
+    EXPECTED_ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+
+    if [[ -n "$EFI_PARTTYPE" ]]; then
+        [[ "${EFI_PARTTYPE,,}" == "$EXPECTED_ESP_GUID" ]] \
+            || fail "UEFI preparation refused: CHR partition 1 has unexpected GPT type '${EFI_PARTTYPE}'."
+    else
+        warn "GPT partition type was not reported by blkid; validating partition 1 by filesystem and EFI bootloader contents instead."
+    fi
+
+    # Validate partition 1 by its actual contents:
+    #   1. it is the expected ext2 boot filesystem;
+    #   2. it mounts successfully read-only;
+    #   3. it contains the x86 UEFI bootloader BOOTX64.EFI.
+    [[ "${EFI_FSTYPE,,}" == "ext2" ]] \
+        || fail "UEFI preparation refused: CHR partition 1 is not the expected ext2 boot filesystem (detected '${EFI_FSTYPE:-unknown}')."
 
     mount -o ro "$EFI_PART" "$UEFI_MOUNT_DIR" \
         || fail "Failed to mount the original CHR boot partition."
@@ -790,7 +804,7 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     sync
 
     RESTORED_BOOT_FILE="$(find "$UEFI_MOUNT_DIR" -type f \
-        -path '*/EFI/BOOT/BOOTX64.EFI' -print -quit 2>/dev/null || true)"
+        -iname 'bootx64.efi' -print -quit 2>/dev/null || true)"
 
     [[ -n "$RESTORED_BOOT_FILE" ]] \
         || fail "UEFI bootloader verification failed after FAT16 conversion."
@@ -798,11 +812,22 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     FINAL_EFI_FSTYPE="$(blkid -o value -s TYPE "$EFI_PART" 2>/dev/null || true)"
     FINAL_EFI_PARTTYPE="$(blkid -o value -s PART_ENTRY_TYPE "$EFI_PART" 2>/dev/null || true)"
 
-    [[ "$FINAL_EFI_FSTYPE" == "vfat" ]] \
+    [[ "${FINAL_EFI_FSTYPE,,}" == "vfat" ]] \
         || fail "UEFI filesystem verification failed: expected vfat, detected '${FINAL_EFI_FSTYPE:-unknown}'."
 
-    [[ "${FINAL_EFI_PARTTYPE,,}" == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" ]] \
-        || fail "UEFI partition verification failed: partition 1 is no longer an EFI System Partition."
+    # The partition table is intentionally preserved. If blkid can read the
+    # GPT type, ensure it still matches the EFI System Partition GUID. If the
+    # type remains unavailable, keep the image unchanged and rely on the
+    # verified FAT filesystem + BOOTX64.EFI checks.
+    if [[ -n "$FINAL_EFI_PARTTYPE" ]]; then
+        [[ "${FINAL_EFI_PARTTYPE,,}" == "$EXPECTED_ESP_GUID" ]] \
+            || fail "UEFI partition verification failed: partition 1 has unexpected GPT type '${FINAL_EFI_PARTTYPE}'."
+    else
+        warn "Final GPT partition type is not exposed by blkid; FAT filesystem and EFI bootloader checks passed."
+    fi
+
+    # CHR's hybrid partition table is deliberately not rewritten here because
+    # its BIOS bootloader uses fixed layout/offset assumptions.
 
     umount "$UEFI_MOUNT_DIR" \
         || fail "Failed to unmount the prepared UEFI boot partition."
