@@ -31,8 +31,4 @@ MikroTik CHR Long-term:
 
 Run:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/nawidsadeghi/ubuntu-chr/refs/heads/main/install-chr.sh \
--o /tmp/install-chr.sh && \
-chmod 700 /tmp/install-chr.sh && \
-sudo /tmp/install-chr.sh
+curl -fsSL https://raw.githubusercontent.com/aryananet/ubuntuchr/main/install-chr.sh | sudo bash
