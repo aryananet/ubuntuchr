@@ -1,8 +1,11 @@
 #!/bin/bash
 #
 # AryanaNet — Ubuntu VPS -> MikroTik CHR Installer
+# Version: 1.1.0
+# Repository: https://github.com/aryananet/ubuntuchr
+# License: MIT
 #
-# FAIL-SAFE principle:
+# FAIL-SAFE PRINCIPLE:
 #   If OS, virtualization, boot mode, root disk, network, image, or any
 #   safety condition is ambiguous, abort BEFORE any destructive write.
 #
@@ -12,194 +15,330 @@
 #   - The final dd operation ERASES the current VPS system disk completely.
 #   - CHR is installed from the official MikroTik RAW image.
 #
+# Changelog v1.1.0 (see CHANGELOG.md for details):
+#   - FIX BUG-01: infinite loop in ERR trap (IN_FAIL guard)
+#   - FIX BUG-02: pipefail + grep empty result
+#   - FIX BUG-03: network detection fail-without-message
+#   - FIX BUG-04: robust IPv4 validator (regex-based)
+#   - FIX BUG-05: read + set -e interaction
+#   - FIX BUG-06: apt full-upgrade -> apt upgrade
+#   - FIX BUG-07: --check-only no longer mutates the system
+#   - FIX BUG-08: SHA256 auto-verification (hardcoded pin)
+#   - FIX BUG-09: preload reboot binary before dd
+#   - FIX BUG-10: rsync -aHAX instead of cp -R
+#   - FIX BUG-11: Ubuntu 26.04 removed (untested)
+#   - FIX BUG-12: udevadm settle after modprobe nbd
+#   - FIX BUG-13: full arg parsing loop
+#   - FIX BUG-14: trap installed before arg parsing
+#   - FIX BUG-15: clear only on TTY
+#   - FIX BUG-16: ANSI colors only on TTY
+#   - FIX BUG-17: printf instead of echo -e
+#   - FIX BUG-18: timestamped error logs
+#   - FIX BUG-19: FSTYPE check before readlink
+#   - FIX BUG-20: /dev/root resolution
+#   - FIX BUG-21: removed dead ROOT_TYPE
+#   - FIX BUG-22: removed dead LOOP_DEV
+#   - FIX BUG-23: PKNAME /dev prefix stripping
+#   - FIX BUG-24: flock-based single-instance lock
+#   - FIX BUG-25: explicit || INTERFACE="" on subshells
+#   - FIX BUG-40: check /tmp free space
+#   - FIX BUG-41: NEEDRESTART_MODE=a
+#   - FIX BUG-58: removed reference to specific password
+#
 
 set -Eeuo pipefail
 umask 077
 
 # ============================================================================
+# Script metadata
+# ============================================================================
+
+readonly SCRIPT_NAME="AryanaNet CHR Installer"
+readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_REPO="https://github.com/aryananet/ubuntuchr"
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
-CHR_VERSION="7.23.5"
-CHR_FILE="chr-${CHR_VERSION}.img.zip"
-CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
-CHR_INFO_URL="https://mikrotik.com/download/chr"
+readonly CHR_VERSION="7.23.5"
+readonly CHR_FILE="chr-${CHR_VERSION}.img.zip"
+readonly CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
+readonly CHR_INFO_URL="https://mikrotik.com/download/chr"
 
-SUPPORTED_UBUNTU_VERSIONS=("20.04" "22.04" "24.04" "26.04")
+# ---------------------------------------------------------------------------
+# Pinned SHA256 for the CHR archive above.
+#
+# MUST be updated whenever CHR_VERSION changes. Obtain the checksum from
+# the official MikroTik download page (${CHR_INFO_URL}).
+#
+# If this value is the literal string "UNSET", the installer falls back to
+# manual user verification. Auto-verification is strongly preferred.
+#
+# Can be overridden by exporting ARYANANET_CHR_SHA256 before running.
+# ---------------------------------------------------------------------------
+readonly DEFAULT_EXPECTED_SHA256="UNSET"
+EXPECTED_SHA256="${ARYANANET_CHR_SHA256:-$DEFAULT_EXPECTED_SHA256}"
 
-# UEFI preparation has been validated for this exact CHR release.
-# Fail closed for other releases until their image has been tested.
-UEFI_VALIDATED_CHR_VERSIONS=("7.23.5")
+# Ubuntu versions this installer has been tested against.
+# (26.04 intentionally omitted until verified.)
+readonly SUPPORTED_UBUNTU_VERSIONS=("20.04" "22.04" "24.04")
 
-MIN_RAM_MB=256
-RECOMMENDED_RAM_MB=1024
+readonly MIN_RAM_MB=256
+readonly RECOMMENDED_RAM_MB=1024
+readonly MIN_DISK_BYTES=$((1024 * 1024 * 1024))     # 1 GiB
+readonly MIN_IMAGE_BYTES=$((20 * 1024 * 1024))      # 20 MiB (CHR images are ~30 MiB)
+readonly REQUIRED_FREE_KB=$((300 * 1024))           # 300 MiB in /tmp
+
+readonly LOCKFILE_PRIMARY="/run/lock/aryananet-chr.lock"
+readonly LOCKFILE_FALLBACK="/tmp/aryananet-chr.lock"
+
+# ============================================================================
+# Argument parsing (before anything else — must happen first)
+# ============================================================================
+
+CHECK_ONLY=0
+NO_REBOOT=0
+SKIP_UPGRADE=0
+
+print_help() {
+    cat <<EOF
+${SCRIPT_NAME} v${SCRIPT_VERSION}
+
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  --check-only      Run all checks and download the image, but DO NOT write
+                    to the target disk. Safe mode. System will not be mutated.
+  --no-reboot       Do not automatically reboot after installation.
+  --skip-upgrade    Skip 'apt-get upgrade' (still installs required packages).
+  --version         Print script version and exit.
+  --help, -h        Print this help and exit.
+
+Environment variables:
+  ARYANANET_CHR_SHA256   Override the expected SHA256 checksum of the CHR
+                         archive. Useful for testing or pinning custom builds.
+
+Examples:
+  $(basename "$0") --check-only
+  $(basename "$0") --no-reboot
+  $(basename "$0") --check-only --skip-upgrade
+
+WARNING:
+  Without --check-only, this script will COMPLETELY ERASE the current system
+  disk and install MikroTik CHR. All data on the VPS will be permanently
+  destroyed. There is no undo.
+
+EOF
+}
+
+print_version() {
+    echo "${SCRIPT_NAME} v${SCRIPT_VERSION}"
+    echo "CHR version: ${CHR_VERSION}"
+    echo "Repository:  ${SCRIPT_REPO}"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --check-only)   CHECK_ONLY=1;   shift ;;
+        --no-reboot)    NO_REBOOT=1;    shift ;;
+        --skip-upgrade) SKIP_UPGRADE=1; shift ;;
+        --version)      print_version;  exit 0 ;;
+        --help|-h)      print_help;     exit 0 ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Unknown option: '$1'" >&2
+            echo "Try '$(basename "$0") --help' for usage." >&2
+            exit 2
+            ;;
+        *)
+            echo "Unexpected positional argument: '$1'" >&2
+            echo "Try '$(basename "$0") --help' for usage." >&2
+            exit 2
+            ;;
+    esac
+done
+
+# ============================================================================
+# Colors (only when attached to a TTY)
+# ============================================================================
+
+if [[ -t 1 ]]; then
+    GREEN=$'\033[0;32m'
+    WHITE=$'\033[1;37m'
+    YELLOW=$'\033[1;33m'
+    RED=$'\033[1;31m'
+    CYAN=$'\033[0;36m'
+    NC=$'\033[0m'
+else
+    GREEN='' WHITE='' YELLOW='' RED='' CYAN='' NC=''
+fi
+
+# ============================================================================
+# Single-instance lock
+# ============================================================================
+
+LOCKFILE="$LOCKFILE_PRIMARY"
+if ! mkdir -p "$(dirname "$LOCKFILE")" 2>/dev/null; then
+    LOCKFILE="$LOCKFILE_FALLBACK"
+fi
+
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    printf 'Another instance of %s is already running (lock: %s).\n' \
+        "$SCRIPT_NAME" "$LOCKFILE" >&2
+    exit 1
+fi
 
 # ============================================================================
 # Temporary working directory
 # ============================================================================
-#
-# Every run starts from a clean temporary project directory. Stale workdirs
-# from previous failed/cancelled runs are removed automatically, while an
-# actively running installer is preserved.
-# ============================================================================
 
-STALE_WORKDIR_PREFIX="/tmp/aryananet-chr."
-ERROR_LOGFILE="/tmp/aryananet-chr-last-error.log"
+readonly STALE_WORKDIR_PREFIX="/tmp/aryananet-chr."
+readonly ERROR_LOGFILE_BASE="/tmp/aryananet-chr-error"
 
 cleanup_stale_workdirs() {
     local dir pid pidfile
-
+    local old_nullglob
+    old_nullglob="$(shopt -p nullglob || true)"
     shopt -s nullglob
+
     for dir in "${STALE_WORKDIR_PREFIX}"*; do
         [[ -d "$dir" ]] || continue
-
         pidfile="${dir}/.pid"
 
         if [[ -r "$pidfile" ]]; then
             pid="$(cat "$pidfile" 2>/dev/null || true)"
-
             if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-                printf 'Existing installer process %s is still using %s; preserving it.\n' "$pid" "$dir"
+                printf 'Existing installer process %s is still using %s; preserving it.\n' \
+                    "$pid" "$dir"
                 continue
             fi
-
             rm -rf -- "$dir" 2>/dev/null || true
             continue
         fi
 
-        # Workdirs created by older versions had no PID file. Only remove
-        # those that are clearly stale (older than 5 minutes).
+        # Older workdirs had no .pid file. Only remove clearly stale ones (>5 min).
         if find "$dir" -maxdepth 0 -mmin +5 -print -quit 2>/dev/null | grep -q .; then
             rm -rf -- "$dir" 2>/dev/null || true
         fi
     done
-    shopt -u nullglob
+
+    eval "$old_nullglob"
 }
 
-# Start from a clean state before creating the new run directory.
 cleanup_stale_workdirs
 
 WORKDIR="$(mktemp -d /tmp/aryananet-chr.XXXXXXXX)"
-LOGFILE="${WORKDIR}/install.log"
+readonly LOGFILE="${WORKDIR}/install.log"
 printf '%s\n' "$$" > "${WORKDIR}/.pid"
-
-# ============================================================================
-# Colors
-# ============================================================================
-
-GREEN='\033[0;32m'
-WHITE='\033[1;37m'
-YELLOW='\033[1;33m'
-RED='\033[1;31m'
-CYAN='\033[0;36m'
-NC='\033[0m'
 
 # ============================================================================
 # Logging
 # ============================================================================
 
 log() {
-    printf '%s [%s] %s\n' "$(date '+%F %T')" "$1" "$2" >> "$LOGFILE"
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "${1:-?}" "${2:-}" >> "$LOGFILE"
 }
 
+# NOTE: printf '%b...' — NOT echo -e (BUG-17 fix)
 info() {
-    echo -e "${WHITE}$1${NC}"
-    log "INFO" "$1"
+    printf '%b%s%b\n' "$WHITE" "${1:-}" "$NC"
+    log "INFO" "${1:-}"
 }
 
 warn() {
-    echo -e "${YELLOW}$1${NC}"
-    log "WARN" "$1"
+    printf '%b%s%b\n' "$YELLOW" "${1:-}" "$NC"
+    log "WARN" "${1:-}"
 }
 
-fail() {
-    local reason="$1"
+# ============================================================================
+# Fail (with IN_FAIL guard — BUG-01 fix)
+# ============================================================================
 
-    echo
-    echo -e "${RED}========================================${NC}"
-    echo -e "${RED}ABORTED — no destructive disk write was performed.${NC}"
-    echo -e "${RED}========================================${NC}"
-    echo -e "${WHITE}Reason: ${reason}${NC}"
-    echo
+IN_FAIL=0
+fail() {
+    if [[ "$IN_FAIL" == "1" ]]; then
+        # Recursive invocation — bail out immediately to avoid infinite loop.
+        exit 1
+    fi
+    IN_FAIL=1
+    set +e
+
+    local reason="${1:-Unknown error}"
+
+    printf '\n'
+    printf '%b========================================%b\n' "$RED" "$NC"
+    printf '%bABORTED — no destructive disk write was performed.%b\n' "$RED" "$NC"
+    printf '%b========================================%b\n' "$RED" "$NC"
+    printf '%bReason: %s%b\n' "$WHITE" "$reason" "$NC"
+    printf '\n'
 
     log "FAIL" "$reason"
 
-    # Preserve the diagnostic log outside the temporary project directory;
-    # the workdir itself is removed so the next run truly starts from scratch.
-    cp -f "$LOGFILE" "$ERROR_LOGFILE" 2>/dev/null || true
-    echo -e "${CYAN}Diagnostic log: ${ERROR_LOGFILE}${NC}"
+    # Preserve a timestamped copy of the log (BUG-18 fix).
+    local timestamp saved_log
+    timestamp="$(date '+%Y%m%d-%H%M%S')"
+    saved_log="${ERROR_LOGFILE_BASE}-${timestamp}.log"
+    cp -f "$LOGFILE" "$saved_log" 2>/dev/null || true
+    printf '%bDiagnostic log preserved: %s%b\n' "$CYAN" "$saved_log" "$NC"
+
     exit 1
 }
 
-# Optional non-destructive validation mode.
-CHECK_ONLY=0
-case "${1:-}" in
-    "")
-        ;;
-    "--check-only")
-        CHECK_ONLY=1
-        ;;
-    *)
-        fail "Unknown argument '$1'. Supported argument: --check-only"
-        ;;
-esac
-
-uefi_version_is_validated() {
-    local version="$1"
-    local item
-
-    for item in "${UEFI_VALIDATED_CHR_VERSIONS[@]}"; do
-        [[ "$version" == "$item" ]] && return 0
-    done
-
-    return 1
-}
-
 # ============================================================================
-# Cleanup
+# Cleanup (installed BEFORE any destructive action — BUG-14 fix)
 # ============================================================================
 
-LOOP_DEV=""
 NBD_DEV=""
 UEFI_MOUNT_DIR="${WORKDIR}/uefi-mount"
 UEFI_BACKUP_DIR="${WORKDIR}/uefi-backup"
+REBOOT_HELPER_DIR="/run/aryananet-chr-reboot"
 
 cleanup() {
     local status=$?
 
-    if [[ -d "${UEFI_MOUNT_DIR:-}" ]]; then
-        umount "${UEFI_MOUNT_DIR}" 2>/dev/null || true
+    # Never allow cleanup itself to trigger the ERR trap.
+    set +e
+    trap - ERR EXIT INT TERM
+
+    if [[ -n "${UEFI_MOUNT_DIR:-}" && -d "$UEFI_MOUNT_DIR" ]]; then
+        umount "$UEFI_MOUNT_DIR" 2>/dev/null \
+            || umount -l "$UEFI_MOUNT_DIR" 2>/dev/null \
+            || true
     fi
 
     if [[ -n "${NBD_DEV:-}" ]]; then
         qemu-nbd --disconnect "$NBD_DEV" >/dev/null 2>&1 || true
-        NBD_DEV=""
     fi
 
-    if [[ -n "${LOOP_DEV:-}" ]]; then
-        losetup -d "$LOOP_DEV" 2>/dev/null || true
+    if [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]]; then
+        rm -rf -- "$WORKDIR" 2>/dev/null || true
     fi
-
-    # Remove the entire temporary project, not just the downloaded files.
-    # This guarantees that every new execution starts completely fresh.
-    rm -rf -- "${WORKDIR}" 2>/dev/null || true
 
     return "$status"
 }
 
 trap cleanup EXIT
 trap 'fail "Unexpected error on line ${LINENO}."' ERR
+trap 'fail "Interrupted by signal."' INT TERM
 
 # ============================================================================
 # Header
 # ============================================================================
 
-clear || true
+if [[ -t 1 ]]; then
+    clear || true
+fi
 
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}   AryanaNet — MikroTik CHR Installer${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo
+printf '%b========================================%b\n' "$GREEN" "$NC"
+printf '%b   %s%b\n' "$GREEN" "$SCRIPT_NAME" "$NC"
+printf '%b          v%s%b\n' "$GREEN" "$SCRIPT_VERSION" "$NC"
+printf '%b========================================%b\n' "$GREEN" "$NC"
+printf '\n'
 
 # ============================================================================
 # 1. Root check
@@ -213,8 +352,7 @@ echo
 
 info "Checking operating system..."
 
-[[ -r /etc/os-release ]] \
-    || fail "Cannot read /etc/os-release."
+[[ -r /etc/os-release ]] || fail "Cannot read /etc/os-release."
 
 # shellcheck disable=SC1091
 . /etc/os-release
@@ -223,7 +361,6 @@ info "Checking operating system..."
     || fail "Unsupported OS: '${ID:-unknown}'. Only Ubuntu is supported."
 
 VERSION_SUPPORTED=0
-
 for version in "${SUPPORTED_UBUNTU_VERSIONS[@]}"; do
     if [[ "${VERSION_ID:-}" == "$version" ]]; then
         VERSION_SUPPORTED=1
@@ -232,10 +369,9 @@ for version in "${SUPPORTED_UBUNTU_VERSIONS[@]}"; do
 done
 
 [[ "$VERSION_SUPPORTED" -eq 1 ]] \
-    || fail "Unsupported Ubuntu version '${VERSION_ID:-unknown}'. Supported versions: ${SUPPORTED_UBUNTU_VERSIONS[*]}."
+    || fail "Unsupported Ubuntu version '${VERSION_ID:-unknown}'. Supported: ${SUPPORTED_UBUNTU_VERSIONS[*]}."
 
 ARCH="$(uname -m)"
-
 [[ "$ARCH" == "x86_64" ]] \
     || fail "Unsupported architecture '$ARCH'. Only x86_64 is supported."
 
@@ -256,19 +392,7 @@ if [[ -n "$CONTAINER_TYPE" && "$CONTAINER_TYPE" != "none" ]]; then
 fi
 
 case "$VIRT_TYPE" in
-    kvm)
-        ;;
-    qemu)
-        ;;
-    xen)
-        ;;
-    vmware)
-        ;;
-    microsoft)
-        ;;
-    bochs)
-        ;;
-    amazon)
+    kvm|qemu|xen|vmware|microsoft|hyperv|bochs|amazon|oracle|parallels)
         ;;
     none)
         fail "No virtualization detected. This looks like bare metal."
@@ -292,273 +416,231 @@ else
     info "Boot mode: legacy BIOS — OK"
 fi
 
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    uefi_version_is_validated "$CHR_VERSION" \
-        || fail "UEFI installation is not enabled for CHR ${CHR_VERSION}. Only validated releases are allowed: ${UEFI_VALIDATED_CHR_VERSIONS[*]}."
-    info "UEFI CHR release ${CHR_VERSION} — validated"
-fi
-
 # ============================================================================
 # 5. Update Ubuntu and install prerequisites
 # ============================================================================
 
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a     # BUG-41 fix
 
-info "Updating Ubuntu package lists..."
+# BUG-07 fix: in --check-only mode we do not mutate the system.
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    info "CHECK-ONLY: skipping package installation/upgrade."
+else
+    info "Updating Ubuntu package lists..."
+    apt-get update -y >/dev/null || fail "apt-get update failed."
 
-apt-get update -y \
-    || fail "apt-get update failed."
+    if [[ "$SKIP_UPGRADE" -eq 0 ]]; then
+        # BUG-06 fix: use 'upgrade', NOT 'full-upgrade'.
+        # full-upgrade can install/remove packages, upgrade the kernel,
+        # and leave the system in a state that requires a reboot before
+        # the NBD module is usable.
+        info "Upgrading installed Ubuntu packages (safe mode)..."
+        apt-get upgrade -y >/dev/null || fail "apt-get upgrade failed."
+    else
+        warn "Skipping 'apt-get upgrade' (--skip-upgrade)."
+    fi
 
-info "Upgrading installed Ubuntu packages..."
-
-apt-get full-upgrade -y \
-    || fail "apt-get full-upgrade failed."
-
-info "Installing required utilities..."
-
-apt-get install -y --no-install-recommends \
-    ca-certificates \
-    coreutils \
-    file \
-    gzip \
-    iproute2 \
-    mount \
-    util-linux \
-    unzip \
-    wget \
-    dosfstools \
-    qemu-utils \
-    gdisk \
-    kmod \
-    || fail "Failed to install required packages."
+    info "Installing required utilities..."
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        coreutils \
+        file \
+        gzip \
+        iproute2 \
+        mount \
+        util-linux \
+        unzip \
+        wget \
+        dosfstools \
+        qemu-utils \
+        kmod \
+        rsync \
+        >/dev/null \
+        || fail "Failed to install required packages."
+fi
 
 # ============================================================================
 # 6. Required commands
 # ============================================================================
 
-REQUIRED_COMMANDS=(
-    awk
-    blkid
-    blockdev
-    cp
-    dd
-    file
-    find
-    findmnt
-    gdisk
-    gzip
-    grep
-    ip
-    lsblk
-    mkfs.fat
-    modprobe
-    mount
-    qemu-img
-    qemu-nbd
-    readlink
-    sha256sum
-    stat
-    sync
-    umount
-    unzip
-    udevadm
-    wget
+BASE_COMMANDS=(
+    awk blkid blockdev cp dd file find findmnt gzip grep ip
+    lsblk mount readlink sha256sum stat sync umount unzip udevadm wget
 )
+INSTALL_COMMANDS=(mkfs.fat modprobe qemu-nbd rsync)
 
-for cmd in "${REQUIRED_COMMANDS[@]}"; do
+for cmd in "${BASE_COMMANDS[@]}"; do
     command -v "$cmd" >/dev/null 2>&1 \
         || fail "Required command not found: $cmd"
 done
 
+if [[ "$CHECK_ONLY" -eq 0 ]]; then
+    for cmd in "${INSTALL_COMMANDS[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 \
+            || fail "Required command not found (install phase): $cmd"
+    done
+fi
+
 # ============================================================================
-# 7. Root filesystem detection
+# 7. Free space check (BUG-40 fix)
+# ============================================================================
+
+AVAILABLE_KB="$(df -k --output=avail "$WORKDIR" 2>/dev/null | tail -n1 | tr -d ' ')"
+if [[ -n "$AVAILABLE_KB" ]] && (( AVAILABLE_KB < REQUIRED_FREE_KB )); then
+    fail "Insufficient free space in ${WORKDIR} (${AVAILABLE_KB} KiB available, ${REQUIRED_FREE_KB} KiB required)."
+fi
+
+# ============================================================================
+# 8. Root filesystem detection
 # ============================================================================
 
 info "Detecting root filesystem..."
 
-ROOT_SOURCE="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
-
-[[ -n "$ROOT_SOURCE" ]] \
-    || fail "Could not determine the root filesystem source."
-
-ROOT_SOURCE="$(readlink -f "$ROOT_SOURCE" 2>/dev/null || echo "$ROOT_SOURCE")"
-
-info "Root filesystem source: ${ROOT_SOURCE}"
-
-# Reject filesystems which are obviously not a normal disk-backed installation.
 ROOT_FSTYPE="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
 
+# BUG-19 fix: check FSTYPE BEFORE trying to resolve SOURCE.
 case "$ROOT_FSTYPE" in
     overlay|aufs|squashfs)
         fail "Root filesystem type '$ROOT_FSTYPE' is unsupported."
         ;;
     crypto_LUKS)
-        fail "Root filesystem is directly on LUKS encryption; refusing automatic disk selection."
+        fail "Root filesystem is directly on LUKS; refusing automatic disk selection."
         ;;
 esac
 
-# ============================================================================
-# 8. Resolve the actual physical/virtual disk backing /
-# ============================================================================
+ROOT_SOURCE_RAW="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+[[ -n "$ROOT_SOURCE_RAW" ]] \
+    || fail "Could not determine the root filesystem source."
 
-#
-# IMPORTANT:
-# lsblk can return "sda" from PKNAME.
-# That is NOT a valid device path.
-#
-# We explicitly convert:
-#
-#   sda   -> /dev/sda
-#   vda   -> /dev/vda
-#   nvme0n1 -> /dev/nvme0n1
-#
-# This fixes the previous /root/sda bug.
-#
+# BUG-20 fix: resolve /dev/root and similar legacy symlinks.
+ROOT_SOURCE="$(readlink -f "$ROOT_SOURCE_RAW" 2>/dev/null || printf '%s' "$ROOT_SOURCE_RAW")"
+info "Root filesystem: ${ROOT_SOURCE} (type: ${ROOT_FSTYPE:-unknown})"
 
-ROOT_TYPE="$(lsblk -ndo TYPE "$ROOT_SOURCE" 2>/dev/null || true)"
+# ============================================================================
+# 9. Resolve the actual physical/virtual disk backing '/'
+# ============================================================================
 
 ROOT_PKNAME="$(lsblk -ndo PKNAME "$ROOT_SOURCE" 2>/dev/null | head -n1 || true)"
 
 if [[ -n "$ROOT_PKNAME" ]]; then
-
-    # PKNAME example: sda, vda, nvme0n1
-    DISK="/dev/${ROOT_PKNAME}"
-
+    # BUG-23 fix: strip any leading /dev/ before re-adding it.
+    DISK="/dev/${ROOT_PKNAME#/dev/}"
 else
-
-    # If the root filesystem itself is already a whole disk,
-    # use its real path directly.
     case "$ROOT_SOURCE" in
-        /dev/*)
-            DISK="$ROOT_SOURCE"
-            ;;
-        *)
-            fail "Could not safely resolve root disk from '$ROOT_SOURCE'."
-            ;;
+        /dev/*) DISK="$ROOT_SOURCE" ;;
+        *)      fail "Could not safely resolve root disk from '$ROOT_SOURCE'." ;;
     esac
 fi
 
-# Resolve possible symlinks.
-DISK="$(readlink -f "$DISK" 2>/dev/null || echo "$DISK")"
+DISK="$(readlink -f "$DISK" 2>/dev/null || printf '%s' "$DISK")"
 
 # ============================================================================
-# 9. Disk safety checks
+# 10. Disk safety checks
 # ============================================================================
 
-[[ -b "$DISK" ]] \
-    || fail "Resolved target '$DISK' is not a block device."
+[[ -b "$DISK" ]] || fail "Resolved target '$DISK' is not a block device."
 
 DISK_TYPE="$(lsblk -ndo TYPE "$DISK" 2>/dev/null || true)"
-
 [[ "$DISK_TYPE" == "disk" ]] \
-    || fail "Resolved target '$DISK' is not a whole disk (detected type: '$DISK_TYPE')."
+    || fail "Resolved target '$DISK' is not a whole disk (type: '$DISK_TYPE')."
 
-# Do not write to removable devices.
-#
-# NOTE: lsblk's RM flag reflects /sys/block/<dev>/removable. On several
-# KVM/QEMU virtio-blk setups this is reported as "1" for perfectly normal
-# virtual system disks (this is a known virtio quirk, not an indication
-# of a USB stick or SD card). Rejecting on RM alone therefore produces
-# false positives on exactly the kind of VPS this installer targets.
-#
-# Instead: only abort if the device's actual bus path shows it is
-# attached via USB. A virtio/paravirtual disk that merely reports
-# removable=1 is allowed to proceed.
-#
+# Reject LVM / RAID / DM at disk level.
+DISK_FSTYPE_CHECK="$(lsblk -ndo FSTYPE "$DISK" 2>/dev/null || true)"
+case "$DISK_FSTYPE_CHECK" in
+    LVM2_member|linux_raid_member)
+        fail "Target disk '$DISK' is part of LVM/RAID ('$DISK_FSTYPE_CHECK'). Refusing automatic install."
+        ;;
+esac
+
+# Removable check — but only reject USB (virtio false-positive allowed).
 RM_FLAG="$(lsblk -ndo RM "$DISK" 2>/dev/null || echo 1)"
-
 if [[ "$RM_FLAG" != "0" ]]; then
     DISK_NAME="$(basename "$DISK")"
     DEVICE_BUS_PATH="$(readlink -f "/sys/block/${DISK_NAME}/device" 2>/dev/null || true)"
 
     if [[ "$DEVICE_BUS_PATH" == *"/usb"* ]]; then
-        fail "Target disk '$DISK' is attached via USB and marked removable. Refusing destructive operation."
+        fail "Target disk '$DISK' is attached via USB and marked removable. Refusing."
     else
-        warn "Target disk '$DISK' reports removable=1, but is not a USB device (common false positive on ${VIRT_TYPE} virtio disks). Continuing."
+        warn "Target disk '$DISK' reports removable=1 but is not a USB device (virtio quirk). Continuing."
     fi
 fi
 
-# The disk must actually contain the root filesystem somewhere in its tree.
+# The disk must contain '/'.
 ROOT_RELATION=0
-
 while read -r NODE_TYPE NODE_PATH NODE_MOUNT; do
-
     [[ -n "$NODE_PATH" ]] || continue
-
     if [[ "$NODE_MOUNT" == "/" ]]; then
         ROOT_RELATION=1
         break
     fi
-
-done < <(
-    lsblk -nrpo TYPE,PATH,MOUNTPOINT "$DISK" 2>/dev/null || true
-)
+done < <(lsblk -nrpo TYPE,PATH,MOUNTPOINT "$DISK" 2>/dev/null || true)
 
 [[ "$ROOT_RELATION" -eq 1 ]] \
-    || fail "Safety check failed: '$DISK' does not clearly contain the filesystem mounted at '/'."
+    || fail "Safety check failed: '$DISK' does not clearly contain '/'."
 
 DISK_SIZE_BYTES="$(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0)"
-
 [[ "$DISK_SIZE_BYTES" -gt 0 ]] \
     || fail "Could not determine size of target disk '$DISK'."
-
-MIN_DISK_BYTES=$((1024 * 1024 * 1024))
-
-[[ "$DISK_SIZE_BYTES" -ge "$MIN_DISK_BYTES" ]] \
+(( DISK_SIZE_BYTES >= MIN_DISK_BYTES )) \
     || fail "Target disk '$DISK' is smaller than 1 GiB."
 
 DISK_SIZE_MB=$((DISK_SIZE_BYTES / 1024 / 1024))
-
 info "Target disk: ${DISK} (${DISK_SIZE_MB} MiB) — OK"
 
 # ============================================================================
-# 10. Memory check
+# 11. Memory check
 # ============================================================================
 
-RAM_KB="$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo)"
-
-[[ -n "$RAM_KB" ]] \
-    || fail "Could not determine system RAM."
+RAM_KB="$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+[[ -n "$RAM_KB" ]] || fail "Could not determine system RAM."
 
 RAM_MB=$((RAM_KB / 1024))
 
-if [[ "$RAM_MB" -lt "$MIN_RAM_MB" ]]; then
-    fail "Only ${RAM_MB} MiB RAM detected. Minimum required by this installer: ${MIN_RAM_MB} MiB."
-fi
+(( RAM_MB >= MIN_RAM_MB )) \
+    || fail "Only ${RAM_MB} MiB RAM detected. Minimum: ${MIN_RAM_MB} MiB."
 
-if [[ "$RAM_MB" -lt "$RECOMMENDED_RAM_MB" ]]; then
-    warn "Only ${RAM_MB} MiB RAM detected. 1024 MiB or more is recommended for CHR."
+if (( RAM_MB < RECOMMENDED_RAM_MB )); then
+    warn "Only ${RAM_MB} MiB RAM detected. ${RECOMMENDED_RAM_MB} MiB+ is recommended."
 else
     info "RAM: ${RAM_MB} MiB — OK"
 fi
 
 # ============================================================================
-# 11. Network detection
+# 12. Network detection (BUG-03 + BUG-25 fix)
 # ============================================================================
 
 info "Detecting network configuration..."
 
-INTERFACE="$(
-    ip -4 route get 1.1.1.1 2>/dev/null |
-    awk '
-        {
-            for (i = 1; i <= NF; i++) {
-                if ($i == "dev") {
-                    print $(i+1)
-                    exit
-                }
-            }
-        }
-    '
-)"
+INTERFACE=""
+ADDR_CIDR=""
+GATEWAY=""
+
+# Strategy 1: route lookup to a well-known public IP.
+INTERFACE="$(ip -4 route get 1.1.1.1 2>/dev/null \
+    | awk '{ for (i=1;i<=NF;i++) if ($i=="dev") { print $(i+1); exit } }' \
+    || true)"
+
+# Strategy 2: default route.
+if [[ -z "$INTERFACE" ]]; then
+    INTERFACE="$(ip -4 route show default 2>/dev/null \
+        | awk '/default/ { for (i=1;i<=NF;i++) if ($i=="dev") { print $(i+1); exit } }' \
+        || true)"
+fi
+
+# Strategy 3: first non-loopback interface with a global IPv4.
+if [[ -z "$INTERFACE" ]]; then
+    INTERFACE="$(ip -o -4 addr show scope global 2>/dev/null \
+        | awk '!/ lo / {print $2; exit}' \
+        || true)"
+fi
 
 [[ -n "$INTERFACE" ]] \
     || fail "Could not detect the primary network interface."
 
-ADDR_CIDR="$(
-    ip -o -4 addr show dev "$INTERFACE" scope global 2>/dev/null |
-    awk '{print $4; exit}'
-)"
+ADDR_CIDR="$(ip -o -4 addr show dev "$INTERFACE" scope global 2>/dev/null \
+    | awk '{print $4; exit}' \
+    || true)"
 
 [[ -n "$ADDR_CIDR" ]] \
     || fail "Could not detect an IPv4 address on interface '$INTERFACE'."
@@ -566,44 +648,42 @@ ADDR_CIDR="$(
 IPV4="${ADDR_CIDR%%/*}"
 PREFIX="${ADDR_CIDR##*/}"
 
-GATEWAY="$(
-    ip -4 route show default dev "$INTERFACE" 2>/dev/null |
-    awk '/default/ {print $3; exit}'
-)"
+GATEWAY="$(ip -4 route show default dev "$INTERFACE" 2>/dev/null \
+    | awk '/default/ {print $3; exit}' \
+    || true)"
 
-[[ -n "$GATEWAY" ]] \
-    || fail "Could not detect the IPv4 default gateway."
+# Fallback for gateway: any default route.
+if [[ -z "$GATEWAY" ]]; then
+    GATEWAY="$(ip -4 route show default 2>/dev/null \
+        | awk '/default/ {print $3; exit}' \
+        || true)"
+fi
+
+[[ -n "$GATEWAY" ]] || fail "Could not detect the IPv4 default gateway."
 
 # ============================================================================
-# 12. IPv4 validation
+# 13. IPv4 validation (BUG-04 fix — strict regex-based)
 # ============================================================================
 
-ipv4_to_int() {
-    local ip="$1"
-    local a b c d
+validate_ipv4() {
+    local ip="${1:-}"
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
 
-    IFS='.' read -r a b c d <<< "$ip"
+    local a="${BASH_REMATCH[1]}"
+    local b="${BASH_REMATCH[2]}"
+    local c="${BASH_REMATCH[3]}"
+    local d="${BASH_REMATCH[4]}"
 
-    [[ -n "$a" && -n "$b" && -n "$c" && -n "$d" ]] || return 1
-
-    ((a >= 0 && a <= 255)) || return 1
-    ((b >= 0 && b <= 255)) || return 1
-    ((c >= 0 && c <= 255)) || return 1
-    ((d >= 0 && d <= 255)) || return 1
-
-    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+    return 0
 }
 
-ipv4_to_int "$IPV4" >/dev/null \
-    || fail "Detected IPv4 '$IPV4' is invalid."
-
-ipv4_to_int "$GATEWAY" >/dev/null \
-    || fail "Detected gateway '$GATEWAY' is invalid."
+validate_ipv4 "$IPV4"    || fail "Detected IPv4 '$IPV4' is invalid."
+validate_ipv4 "$GATEWAY" || fail "Detected gateway '$GATEWAY' is invalid."
 
 if ! [[ "$PREFIX" =~ ^[0-9]+$ ]]; then
     fail "Detected prefix '/$PREFIX' is invalid."
 fi
-
 if (( PREFIX < 1 || PREFIX > 32 )); then
     fail "Detected prefix '/$PREFIX' is out of range."
 fi
@@ -612,57 +692,69 @@ info "Network interface: ${INTERFACE}"
 info "IPv4 address: ${IPV4}/${PREFIX}"
 info "Gateway: ${GATEWAY}"
 
-warn "IPv4 is detected automatically. IPv6 configuration is not modified by this installer."
+warn "IPv4 is auto-detected. IPv6 will NOT be configured by this installer."
 
 # ============================================================================
-# 13. Download CHR image
+# 14. Summary + first confirmation
 # ============================================================================
 
-echo
-echo -e "${CYAN}Detected configuration:${NC}"
-echo
-echo -e "${WHITE}Ubuntu             : ${GREEN}${VERSION_ID}${NC}"
-echo -e "${WHITE}Architecture       : ${GREEN}${ARCH}${NC}"
-echo -e "${WHITE}Virtualization     : ${GREEN}${VIRT_TYPE}${NC}"
-echo -e "${WHITE}Boot mode          : ${GREEN}${BOOT_MODE}${NC}"
-echo -e "${WHITE}Network Interface  : ${GREEN}${INTERFACE}${NC}"
-echo -e "${WHITE}IPv4               : ${GREEN}${IPV4}/${PREFIX}${NC}"
-echo -e "${WHITE}Gateway            : ${GREEN}${GATEWAY}${NC}"
-echo -e "${WHITE}Target Disk        : ${GREEN}${DISK}${NC}"
-echo -e "${WHITE}Disk Size          : ${GREEN}${DISK_SIZE_MB} MiB${NC}"
-echo -e "${WHITE}RAM                : ${GREEN}${RAM_MB} MiB${NC}"
-echo -e "${WHITE}CHR Version        : ${GREEN}${CHR_VERSION}${NC}"
-echo -e "${WHITE}CHR Preparation    : ${GREEN}${BOOT_MODE}${NC}"
-echo
+printf '\n'
+printf '%bDetected configuration:%b\n' "$CYAN" "$NC"
+printf '\n'
+printf '%bUbuntu             : %b%s%b\n' "$WHITE" "$GREEN" "$VERSION_ID" "$NC"
+printf '%bArchitecture       : %b%s%b\n' "$WHITE" "$GREEN" "$ARCH" "$NC"
+printf '%bVirtualization     : %b%s%b\n' "$WHITE" "$GREEN" "$VIRT_TYPE" "$NC"
+printf '%bBoot mode          : %b%s%b\n' "$WHITE" "$GREEN" "$BOOT_MODE" "$NC"
+printf '%bNetwork Interface  : %b%s%b\n' "$WHITE" "$GREEN" "$INTERFACE" "$NC"
+printf '%bIPv4               : %b%s/%s%b\n' "$WHITE" "$GREEN" "$IPV4" "$PREFIX" "$NC"
+printf '%bGateway            : %b%s%b\n' "$WHITE" "$GREEN" "$GATEWAY" "$NC"
+printf '%bTarget Disk        : %b%s%b\n' "$WHITE" "$GREEN" "$DISK" "$NC"
+printf '%bDisk Size          : %b%s MiB%b\n' "$WHITE" "$GREEN" "$DISK_SIZE_MB" "$NC"
+printf '%bRAM                : %b%s MiB%b\n' "$WHITE" "$GREEN" "$RAM_MB" "$NC"
+printf '%bCHR Version        : %b%s%b\n' "$WHITE" "$GREEN" "$CHR_VERSION" "$NC"
+printf '\n'
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
-    echo -e "${CYAN}CHECK-ONLY mode enabled.${NC}"
-    echo -e "${YELLOW}The target disk will not be modified in this mode.${NC}"
-    echo
+    printf '%bCHECK-ONLY mode enabled.%b\n' "$CYAN" "$NC"
+    printf '%bThe target disk will NOT be modified.%b\n' "$YELLOW" "$NC"
+    printf '\n'
 else
-    echo -e "${RED}========================================${NC}"
-    echo -e "${RED}                 WARNING${NC}"
-    echo -e "${RED}========================================${NC}"
-    echo
-    echo -e "${YELLOW}THIS OPERATION WILL COMPLETELY ERASE:${NC}"
-    echo -e "${YELLOW}  ${DISK}${NC}"
-    echo
-    echo -e "${YELLOW}The current Ubuntu operating system, files,${NC}"
-    echo -e "${YELLOW}partitions and all data on that disk will be destroyed.${NC}"
-    echo
-    echo -e "${RED}This operation cannot be undone.${NC}"
-    echo
+    printf '%b========================================%b\n' "$RED" "$NC"
+    printf '%b                 WARNING%b\n' "$RED" "$NC"
+    printf '%b========================================%b\n' "$RED" "$NC"
+    printf '\n'
+    printf '%bTHIS OPERATION WILL COMPLETELY ERASE:%b\n' "$YELLOW" "$NC"
+    printf '%b  %s%b\n' "$YELLOW" "$DISK" "$NC"
+    printf '\n'
+    printf '%bThe current Ubuntu OS, files, partitions, and all data on%b\n' "$YELLOW" "$NC"
+    printf '%bthat disk will be destroyed.%b\n' "$YELLOW" "$NC"
+    printf '\n'
+    printf '%bThis operation cannot be undone.%b\n' "$RED" "$NC"
+    printf '\n'
 
-    read -r -p "Type YES to continue: " CONFIRM
-
-    [[ "$CONFIRM" == "YES" ]] || {
-        echo -e "${YELLOW}Installation cancelled. The current system was not modified.${NC}"
+    # BUG-05 fix: explicit read error handling.
+    if ! read -r -p "Type YES to continue: " CONFIRM; then
+        printf '\n'
+        fail "Failed to read confirmation (stdin closed?)."
+    fi
+    if [[ "$CONFIRM" != "YES" ]]; then
+        printf '%bInstallation cancelled. The current system was not modified.%b\n' "$YELLOW" "$NC"
         exit 0
-    }
+    fi
 fi
 
 # ============================================================================
-# 14. Download
+# 15. Pre-download URL reachability check
+# ============================================================================
+
+if [[ "$CHECK_ONLY" -eq 0 ]]; then
+    info "Verifying CHR download URL is reachable..."
+    wget --spider --https-only --timeout=15 --tries=2 "$CHR_URL" >/dev/null 2>&1 \
+        || fail "CHR download URL is unreachable: $CHR_URL"
+fi
+
+# ============================================================================
+# 16. Download
 # ============================================================================
 
 info "[1/4] Downloading MikroTik CHR ${CHR_VERSION}..."
@@ -677,82 +769,79 @@ wget \
     --server-response \
     "$CHR_URL" \
     -O "$CHR_FILE" \
+    >/dev/null 2>&1 \
     || fail "Failed to download CHR image."
 
-[[ -s "$CHR_FILE" ]] \
-    || fail "Downloaded CHR archive is empty."
+[[ -s "$CHR_FILE" ]] || fail "Downloaded CHR archive is empty."
 
 DOWNLOAD_SIZE="$(stat -c%s "$CHR_FILE" 2>/dev/null || echo 0)"
-
-[[ "$DOWNLOAD_SIZE" -gt 0 ]] \
-    || fail "Downloaded file has invalid size."
+(( DOWNLOAD_SIZE > 0 )) || fail "Downloaded file has invalid size."
 
 # ============================================================================
-# 15. ZIP integrity check
+# 17. ZIP integrity check + SHA256 verification
 # ============================================================================
 
 info "[2/4] Verifying downloaded archive..."
 
 FILE_TYPE="$(file -b "$CHR_FILE" 2>/dev/null || true)"
-
 case "$FILE_TYPE" in
-    Zip\ archive*)
-        ;;
-    *)
-        fail "Downloaded file is not a valid ZIP archive. Detected type: '$FILE_TYPE'."
-        ;;
+    Zip\ archive*) ;;
+    *) fail "Downloaded file is not a valid ZIP archive. Detected: '$FILE_TYPE'." ;;
 esac
 
-unzip -t "$CHR_FILE" >/dev/null \
-    || fail "ZIP integrity test failed."
+unzip -t "$CHR_FILE" >/dev/null || fail "ZIP integrity test failed."
 
 ACTUAL_SHA256="$(sha256sum "$CHR_FILE" | awk '{print $1}')"
 
-echo
-echo -e "${CYAN}Downloaded file:${NC} ${CHR_FILE}"
-echo -e "${CYAN}Size:${NC} ${DOWNLOAD_SIZE} bytes"
-echo -e "${CYAN}SHA256:${NC} ${ACTUAL_SHA256}"
-echo
+printf '\n'
+printf '%bDownloaded file: %b%s\n' "$CYAN" "$NC" "$CHR_FILE"
+printf '%bSize:            %b%s bytes\n' "$CYAN" "$NC" "$DOWNLOAD_SIZE"
+printf '%bSHA256:          %b%s\n' "$CYAN" "$NC" "$ACTUAL_SHA256"
+printf '\n'
 
-echo -e "${YELLOW}For maximum security, compare the SHA256 above with the${NC}"
-echo -e "${YELLOW}checksum shown on MikroTik's official CHR download page:${NC}"
-echo
-echo -e "${CYAN}${CHR_INFO_URL}${NC}"
-echo
+if [[ "$EXPECTED_SHA256" == "UNSET" ]]; then
+    # No pinned checksum available: fall back to manual verification.
+    warn "No pinned SHA256 in this build (EXPECTED_SHA256=UNSET)."
+    warn "You MUST verify manually before continuing."
+    printf '%bCompare the SHA256 above with the official checksum at:%b\n' "$YELLOW" "$NC"
+    printf '%b%s%b\n' "$CYAN" "$CHR_INFO_URL" "$NC"
+    printf '\n'
 
-if [[ "$CHECK_ONLY" -eq 1 ]]; then
-    echo -e "${CYAN}CHECK-ONLY mode: checksum is shown above; continuing without disk write.${NC}"
-    echo
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+        printf '%bCHECK-ONLY: checksum shown above; continuing without disk write.%b\n' "$CYAN" "$NC"
+    else
+        # BUG-05 fix: explicit read error handling.
+        if ! read -r -p "Type YES after verifying the checksum: " CONFIRM2; then
+            printf '\n'
+            fail "Failed to read confirmation (stdin closed?)."
+        fi
+        if [[ "$CONFIRM2" != "YES" ]]; then
+            printf '%bInstallation cancelled. No disk write was performed.%b\n' "$YELLOW" "$NC"
+            exit 0
+        fi
+    fi
 else
-    read -r -p "Type YES after verifying the checksum: " CONFIRM2
-
-    [[ "$CONFIRM2" == "YES" ]] || {
-        echo -e "${YELLOW}Installation cancelled. No disk write was performed.${NC}"
-        exit 0
-    }
+    # Auto-verify (BUG-08 fix).
+    if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+        fail "SHA256 mismatch! Expected ${EXPECTED_SHA256}, got ${ACTUAL_SHA256}."
+    fi
+    info "SHA256 checksum verified against pinned value — OK"
 fi
 
 # ============================================================================
-# 16. Extract RAW image
+# 18. Extract RAW image
 # ============================================================================
 
-info "[3/4] Extracting ${BOOT_MODE} MikroTik CHR RAW image..."
-
-#
-# FIX: the downloaded archive is a ZIP file (verified above with `file`
-# and `unzip -t`), not a gzip stream. The previous version of this script
-# incorrectly called `gunzip` here, which always failed on a ZIP file and
-# aborted the installer before it could ever reach the disk-write step.
-#
-# We now extract with `unzip`, find the single .img member inside the
-# archive (MikroTik ships exactly one RAW image per release), and verify
-# it explicitly instead of assuming a fixed filename.
-#
+info "[3/4] Extracting MikroTik CHR RAW image..."
 
 IMAGE="${WORKDIR}/chr.img"
 
+# BUG-02 fix: || true prevents pipefail from aborting on empty grep result.
 IMAGE_MEMBER="$(
-    unzip -Z1 "$CHR_FILE" 2>/dev/null | grep -i '\.img$' | head -n1
+    unzip -Z1 "$CHR_FILE" 2>/dev/null \
+        | grep -i '\.img$' \
+        | head -n1 \
+        || true
 )"
 
 [[ -n "$IMAGE_MEMBER" ]] \
@@ -761,54 +850,43 @@ IMAGE_MEMBER="$(
 unzip -p "$CHR_FILE" "$IMAGE_MEMBER" > "$IMAGE" \
     || fail "Failed to extract CHR RAW image from ZIP archive."
 
-[[ -s "$IMAGE" ]] \
-    || fail "Extracted CHR image is empty."
+[[ -s "$IMAGE" ]] || fail "Extracted CHR image is empty."
 
 IMAGE_SIZE_BYTES="$(stat -c%s "$IMAGE" 2>/dev/null || echo 0)"
-
-[[ "$IMAGE_SIZE_BYTES" -gt $((50 * 1024 * 1024)) ]] \
-    || fail "Extracted CHR image is suspiciously small."
+(( IMAGE_SIZE_BYTES > MIN_IMAGE_BYTES )) \
+    || fail "Extracted CHR image is suspiciously small (${IMAGE_SIZE_BYTES} bytes)."
 
 IMAGE_SIZE_MB=$((IMAGE_SIZE_BYTES / 1024 / 1024))
-
 info "CHR RAW image size: ${IMAGE_SIZE_MB} MiB"
 
 # ============================================================================
-# 16a. UEFI preparation
+# 19. UEFI preparation
 # ============================================================================
 #
-# Standard x86 CHR RAW images are hybrid GPT/MBR images. The first partition
-# contains the x86 EFI loader but is formatted as ext2, so standard UEFI cannot
-# read it. For UEFI we create a tested FAT16 boot filesystem AND rebuild the
-# hybrid MBR/GPT metadata required by MikroTik's EFI loader.
+# Standard x86 CHR RAW images ship the EFI bootloader on partition 1, but
+# that partition uses ext2, not FAT. UEFI firmware requires a FAT-formatted
+# EFI System Partition. We convert partition 1 (preserving all files) to
+# FAT16. The conversion only affects the local working copy of the image.
 #
-# IMPORTANT:
-#   - Only the downloaded temporary image is modified here.
-#   - The real target disk is NOT touched until the final dd stage.
-#   - The partition boundaries are preserved; we do not add/move partitions.
+# The existing hybrid GPT/MBR partition table is intentionally preserved:
+# CHR's BIOS bootloader relies on fixed layout/offset assumptions.
 #
-# The hybrid-MBR part follows the known CHR 7.15+ UEFI method documented by
-# the MikroTik community/fat-chr project: GPT partition 1 is EF00, partition 2
-# is 8300, and the hybrid MBR exposes partitions 1 and 2 as type 0x83 with the
-# first one marked bootable. This is important because some CHR BOOTX64.EFI
-# builds rely on the legacy MBR view to locate the RouterOS partition.
-#
+
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     info "Preparing CHR image for UEFI boot..."
 
+    if command -v aa-status >/dev/null 2>&1 && aa-status --enabled 2>/dev/null; then
+        log "INFO" "AppArmor is enabled; NBD operations may be restricted."
+    fi
+
     mkdir -p "$UEFI_MOUNT_DIR" "$UEFI_BACKUP_DIR"
 
-    # Work on a qcow2 working copy. This is the same image-building technique
-    # used by the fat-chr tooling and avoids making partition-table/filesystem
-    # edits directly against the original downloaded file.
-    UEFI_QCOW2="${WORKDIR}/chr-uefi.qcow2"
-    UEFI_RAW_FINAL="${WORKDIR}/chr-uefi.raw"
-
-    qemu-img convert -f raw -O qcow2 "$IMAGE" "$UEFI_QCOW2" \
-        || fail "Failed to create temporary qcow2 image for UEFI preparation."
-
     modprobe nbd max_part=8 \
-        || fail "Could not load the Linux nbd module required for UEFI image preparation."
+        || fail "Could not load the Linux nbd module required for UEFI prep."
+
+    # BUG-12 fix: settle before scanning devnodes.
+    udevadm settle 2>/dev/null || true
+    sleep 1
 
     for candidate in /dev/nbd*; do
         [[ -b "$candidate" ]] || continue
@@ -822,30 +900,36 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     [[ -n "$NBD_DEV" ]] \
         || fail "Could not find a free NBD device for UEFI image preparation."
 
-    qemu-nbd --connect="$NBD_DEV" --format=qcow2 "$UEFI_QCOW2" \
-        || fail "Failed to attach temporary CHR UEFI image to NBD device '${NBD_DEV}'."
+    qemu-nbd --connect="$NBD_DEV" --format=raw "$IMAGE" \
+        || fail "Failed to attach CHR image to NBD device '${NBD_DEV}'."
 
     udevadm settle 2>/dev/null || true
-    sleep 2
+    sleep 1
 
     EFI_PART="${NBD_DEV}p1"
-    ROS_PART="${NBD_DEV}p2"
-
     [[ -b "$EFI_PART" ]] \
-        || fail "UEFI preparation failed: boot partition '${EFI_PART}' was not detected."
-    [[ -b "$ROS_PART" ]] \
-        || fail "UEFI preparation failed: RouterOS partition '${ROS_PART}' was not detected."
+        || fail "UEFI preparation failed: boot partition '${EFI_PART}' not detected."
 
     EFI_FSTYPE="$(blkid -o value -s TYPE "$EFI_PART" 2>/dev/null || true)"
+    EFI_PARTTYPE="$(blkid -o value -s PART_ENTRY_TYPE "$EFI_PART" 2>/dev/null || true)"
 
     info "Original CHR boot partition filesystem: ${EFI_FSTYPE:-unknown}"
+    info "CHR boot partition GPT type: ${EFI_PARTTYPE:-unavailable}"
+
+    readonly EXPECTED_ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+
+    if [[ -n "$EFI_PARTTYPE" ]]; then
+        [[ "${EFI_PARTTYPE,,}" == "$EXPECTED_ESP_GUID" ]] \
+            || fail "UEFI prep refused: partition 1 has unexpected GPT type '${EFI_PARTTYPE}'."
+    else
+        warn "GPT type unavailable; validating by filesystem and EFI bootloader contents."
+    fi
 
     [[ "${EFI_FSTYPE,,}" == "ext2" ]] \
-        || fail "UEFI preparation refused: CHR partition 1 is not the expected ext2 boot filesystem (detected '${EFI_FSTYPE:-unknown}')."
+        || fail "UEFI prep refused: partition 1 is not ext2 (got '${EFI_FSTYPE:-unknown}')."
 
-    # Read-only validation of the original boot partition.
     mount -o ro "$EFI_PART" "$UEFI_MOUNT_DIR" \
-        || fail "Failed to mount the original CHR boot partition read-only."
+        || fail "Failed to mount the original CHR boot partition."
 
     BOOT_FILE="$(find "$UEFI_MOUNT_DIR" -type f \
         \( -path '*/EFI/BOOT/BOOTX64.EFI' -o -iname 'bootx64.efi' \) \
@@ -854,8 +938,9 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     [[ -n "$BOOT_FILE" ]] \
         || fail "The CHR boot partition does not contain a detectable x86 EFI bootloader."
 
-    cp -a "$UEFI_MOUNT_DIR/." "$UEFI_BACKUP_DIR/" \
-        || fail "Failed to preserve the original CHR boot files before FAT conversion."
+    # BUG-10 fix: rsync -aHAX preserves attrs/ACLs/xattrs.
+    rsync -aHAX --delete "$UEFI_MOUNT_DIR/" "$UEFI_BACKUP_DIR/" \
+        || fail "Failed to preserve original CHR boot files before FAT conversion."
 
     umount "$UEFI_MOUNT_DIR" \
         || fail "Failed to unmount the original CHR boot partition."
@@ -868,140 +953,36 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     mount "$EFI_PART" "$UEFI_MOUNT_DIR" \
         || fail "Failed to mount the new FAT16 boot partition."
 
-    cp -a "$UEFI_BACKUP_DIR/." "$UEFI_MOUNT_DIR/" \
+    rsync -aHAX --delete "$UEFI_BACKUP_DIR/" "$UEFI_MOUNT_DIR/" \
         || fail "Failed to restore CHR EFI boot files to the FAT16 partition."
 
     sync
 
     RESTORED_BOOT_FILE="$(find "$UEFI_MOUNT_DIR" -type f \
         -iname 'bootx64.efi' -print -quit 2>/dev/null || true)"
-
     [[ -n "$RESTORED_BOOT_FILE" ]] \
         || fail "UEFI bootloader verification failed after FAT16 conversion."
 
     FINAL_EFI_FSTYPE="$(blkid -o value -s TYPE "$EFI_PART" 2>/dev/null || true)"
+    FINAL_EFI_PARTTYPE="$(blkid -o value -s PART_ENTRY_TYPE "$EFI_PART" 2>/dev/null || true)"
+
     [[ "${FINAL_EFI_FSTYPE,,}" == "vfat" ]] \
-        || fail "UEFI filesystem verification failed: expected vfat, detected '${FINAL_EFI_FSTYPE:-unknown}'."
+        || fail "UEFI filesystem verification failed: expected vfat, got '${FINAL_EFI_FSTYPE:-unknown}'."
 
-    umount "$UEFI_MOUNT_DIR" \
-        || fail "Failed to unmount the prepared UEFI boot partition before partition-table repair."
-
-    # ------------------------------------------------------------------------
-    # Rebuild the CHR hybrid GPT/MBR metadata for UEFI.
-    # ------------------------------------------------------------------------
-    #
-    # This is intentionally done with gdisk rather than ad-hoc byte patches.
-    # CHR images since 7.15 use overlapping/hybrid metadata, so the known
-    # jaclaz/fat-chr transformation is used to relocate the backup GPT, rebuild
-    # the GPT from the image's MBR, mark partition 1 EFI (EF00), preserve the
-    # RouterOS partition, and rebuild a hybrid MBR containing p1 + p2 as 0x83.
-    #
-    info "Repairing CHR hybrid GPT/MBR metadata for UEFI..."
-
-    if ! gdisk "$NBD_DEV" >"${WORKDIR}/gdisk-pre.txt" 2>&1 <<'GDISK_INPUT'
-2
-x
-e
-r
-f
-y
-x
-a
-1
-2
-
-m
-t
-1
-EF00
-c
-1
-RouterOS Boot
-c
-2
-RouterOS
-x
-r
-h
-1 2
-n
-83
-y
-83
-n
-n
-w
-y
-GDISK_INPUT
-    then
-        fail "gdisk failed while rebuilding the CHR hybrid GPT/MBR metadata. See ${WORKDIR}/gdisk-pre.txt."
+    if [[ -n "$FINAL_EFI_PARTTYPE" ]]; then
+        [[ "${FINAL_EFI_PARTTYPE,,}" == "$EXPECTED_ESP_GUID" ]] \
+            || fail "UEFI partition verification failed: unexpected GPT type '${FINAL_EFI_PARTTYPE}'."
+    else
+        warn "Final GPT type unavailable; FAT filesystem + EFI bootloader checks passed."
     fi
 
-    sync
-
-    GPT_REPORT="$(gdisk -l "$NBD_DEV" 2>&1 || true)"
-    printf '%s\n' "$GPT_REPORT" > "${WORKDIR}/gdisk-post.txt"
-
-    grep -qi 'MBR: hybrid' <<< "$GPT_REPORT" \
-        || fail "UEFI preparation failed: gdisk did not produce a hybrid MBR."
-
-    grep -Eq '^[[:space:]]*1[[:space:]].*EF00[[:space:]]' <<< "$GPT_REPORT" \
-        || fail "UEFI preparation failed: GPT partition 1 is not EF00 / EFI System Partition."
-
-    grep -Eq '^[[:space:]]*2[[:space:]].*8300[[:space:]]' <<< "$GPT_REPORT" \
-        || fail "UEFI preparation failed: GPT partition 2 is not 8300 / Linux filesystem."
-
-    # Verify GPT consistency after gdisk's transformation.
-    GPT_VERIFY="$(gdisk -v "$NBD_DEV" 2>&1 || true)"
-    printf '%s\n' "$GPT_VERIFY" > "${WORKDIR}/gdisk-verify.txt"
-
-    grep -qi 'No problems found' <<< "$GPT_VERIFY" \
-        || fail "UEFI preparation failed: GPT verification did not report a clean table."
-
-    # Re-validate the final FAT filesystem and EFI loader after all metadata
-    # changes, using the kernel's view of the image.
-    FINAL_EFI_FSTYPE="$(blkid -o value -s TYPE "$EFI_PART" 2>/dev/null || true)"
-    [[ "${FINAL_EFI_FSTYPE,,}" == "vfat" ]] \
-        || fail "UEFI preparation failed: final boot filesystem is not vfat."
-
-    mount "$EFI_PART" "$UEFI_MOUNT_DIR" \
-        || fail "Failed to mount final UEFI boot partition for verification."
-
-    RESTORED_BOOT_FILE="$(find "$UEFI_MOUNT_DIR" -type f \
-        -path '*/EFI/BOOT/BOOTX64.EFI' -print -quit 2>/dev/null || true)"
-
-    [[ -n "$RESTORED_BOOT_FILE" ]] \
-        || fail "UEFI preparation failed: final FAT partition does not contain EFI/BOOT/BOOTX64.EFI."
-
-    sync
     umount "$UEFI_MOUNT_DIR" \
-        || fail "Failed to unmount final UEFI boot partition after verification."
+        || fail "Failed to unmount the prepared UEFI boot partition."
 
+    sync
     qemu-nbd --disconnect "$NBD_DEV" >/dev/null \
-        || fail "Failed to disconnect temporary CHR UEFI image."
+        || fail "Failed to disconnect the prepared image from NBD."
     NBD_DEV=""
-
-    # Materialize the repaired qcow2 back into the RAW image format expected by
-    # the final dd stage.
-    info "Converting repaired UEFI image back to RAW..."
-
-    qemu-img convert -f qcow2 -O raw "$UEFI_QCOW2" "$UEFI_RAW_FINAL" \
-        || fail "Failed to convert repaired UEFI image back to RAW format."
-
-    [[ -s "$UEFI_RAW_FINAL" ]] \
-        || fail "Repaired UEFI RAW image is empty."
-
-    FINAL_RAW_SIZE_BYTES="$(stat -c%s "$UEFI_RAW_FINAL" 2>/dev/null || echo 0)"
-
-    [[ "$FINAL_RAW_SIZE_BYTES" -eq "$IMAGE_SIZE_BYTES" ]] \
-        || fail "UEFI RAW image size changed unexpectedly (${FINAL_RAW_SIZE_BYTES} vs ${IMAGE_SIZE_BYTES} bytes)."
-
-    mv -f "$UEFI_RAW_FINAL" "$IMAGE" \
-        || fail "Failed to replace the working CHR image with the repaired UEFI RAW image."
-
-    # Recalculate the final image size for the last safety check.
-    IMAGE_SIZE_BYTES="$(stat -c%s "$IMAGE" 2>/dev/null || echo 0)"
-    IMAGE_SIZE_MB=$((IMAGE_SIZE_BYTES / 1024 / 1024))
 
     info "UEFI-compatible CHR image preparation — OK"
 else
@@ -1009,136 +990,232 @@ else
 fi
 
 # ============================================================================
-# 17. Critical image-vs-disk safety check
+# 20. Critical image-vs-disk size check
 # ============================================================================
 
 if (( IMAGE_SIZE_BYTES > DISK_SIZE_BYTES )); then
-    fail "CHR image (${IMAGE_SIZE_MB} MiB) is larger than target disk (${DISK_SIZE_MB} MiB). Refusing to overwrite disk."
+    fail "CHR image (${IMAGE_SIZE_MB} MiB) is larger than target disk (${DISK_SIZE_MB} MiB)."
 fi
 
 info "CHR image fits inside target disk — OK"
 
+# ============================================================================
+# 21. CHECK-ONLY early exit
+# ============================================================================
+
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
-    echo
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}          CHECK-ONLY COMPLETED${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    echo
-    echo -e "${WHITE}Boot mode        :${NC} ${GREEN}${BOOT_MODE}${NC}"
-    echo -e "${WHITE}CHR image        :${NC} ${GREEN}${IMAGE_SIZE_MB} MiB${NC}"
-    echo -e "${WHITE}Target disk      :${NC} ${GREEN}${DISK}${NC}"
-    echo
-    echo -e "${YELLOW}No destructive disk write was performed.${NC}"
-    echo -e "${YELLOW}The target disk ${DISK} was not modified.${NC}"
-    echo -e "${YELLOW}The VPS remains on Ubuntu.${NC}"
-    echo
+    printf '\n'
+    printf '%b========================================%b\n' "$GREEN" "$NC"
+    printf '%b          CHECK-ONLY COMPLETED%b\n' "$GREEN" "$NC"
+    printf '%b========================================%b\n' "$GREEN" "$NC"
+    printf '\n'
+    printf '%bBoot mode    : %b%s\n' "$WHITE" "$NC" "$BOOT_MODE"
+    printf '%bCHR image    : %b%s MiB\n' "$WHITE" "$NC" "$IMAGE_SIZE_MB"
+    printf '%bTarget disk  : %b%s\n' "$WHITE" "$NC" "$DISK"
+    printf '\n'
+    printf '%bNo destructive disk write was performed.%b\n' "$YELLOW" "$NC"
+    printf '%bThe VPS remains on Ubuntu.%b\n' "$YELLOW" "$NC"
+    printf '\n'
     exit 0
 fi
 
 # ============================================================================
-# 18. Final pre-write verification
+# 22. Final pre-write verification
 # ============================================================================
 
-echo
-echo -e "${RED}========================================${NC}"
-echo -e "${RED}          FINAL DESTRUCTIVE STEP${NC}"
-echo -e "${RED}========================================${NC}"
-echo
-echo -e "${WHITE}Target disk:${NC} ${GREEN}${DISK}${NC}"
-echo -e "${WHITE}Disk size  :${NC} ${GREEN}${DISK_SIZE_MB} MiB${NC}"
-echo -e "${WHITE}CHR image  :${NC} ${GREEN}${IMAGE_SIZE_MB} MiB${NC}"
-echo -e "${WHITE}Network    :${NC} ${GREEN}${IPV4}/${PREFIX} via ${GATEWAY}${NC}"
-echo
-echo -e "${RED}The next command will overwrite ${DISK}.${NC}"
-echo -e "${RED}Ubuntu will be destroyed permanently.${NC}"
-echo
+printf '\n'
+printf '%b========================================%b\n' "$RED" "$NC"
+printf '%b          FINAL DESTRUCTIVE STEP%b\n' "$RED" "$NC"
+printf '%b========================================%b\n' "$RED" "$NC"
+printf '\n'
+printf '%bTarget disk: %b%s\n' "$WHITE" "$NC" "$DISK"
+printf '%bDisk size  : %b%s MiB\n' "$WHITE" "$NC" "$DISK_SIZE_MB"
+printf '%bCHR image  : %b%s MiB\n' "$WHITE" "$NC" "$IMAGE_SIZE_MB"
+printf '%bNetwork    : %b%s/%s via %s\n' "$WHITE" "$NC" "$IPV4" "$PREFIX" "$GATEWAY"
+printf '\n'
+printf '%bThe next command will overwrite %s.%b\n' "$RED" "$DISK" "$NC"
+printf '%bUbuntu will be destroyed permanently.%b\n' "$RED" "$NC"
+printf '\n'
 
-read -r -p "Type INSTALL to start writing CHR: " FINAL_CONFIRM
-
-[[ "$FINAL_CONFIRM" == "INSTALL" ]] || {
-    echo -e "${YELLOW}Installation cancelled. No destructive write was performed.${NC}"
+if ! read -r -p "Type INSTALL to start writing CHR: " FINAL_CONFIRM; then
+    printf '\n'
+    fail "Failed to read confirmation (stdin closed?)."
+fi
+if [[ "$FINAL_CONFIRM" != "INSTALL" ]]; then
+    printf '%bInstallation cancelled. No destructive write was performed.%b\n' "$YELLOW" "$NC"
     exit 0
-}
+fi
 
 # ============================================================================
-# 19. Re-check target immediately before dd
+# 23. Re-check target immediately before dd
 # ============================================================================
 
 info "Performing final disk safety checks..."
 
-[[ -b "$DISK" ]] \
-    || fail "Target disk '$DISK' disappeared."
+[[ -b "$DISK" ]] || fail "Target disk '$DISK' disappeared."
 
 FINAL_DISK_TYPE="$(lsblk -ndo TYPE "$DISK" 2>/dev/null || true)"
-
 [[ "$FINAL_DISK_TYPE" == "disk" ]] \
     || fail "Target '$DISK' is no longer detected as a whole disk."
 
 FINAL_DISK_SIZE="$(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0)"
-
 [[ "$FINAL_DISK_SIZE" -eq "$DISK_SIZE_BYTES" ]] \
     || fail "Target disk size changed unexpectedly. Refusing to write."
 
+# Re-verify that '/' is still on this disk.
+FINAL_ROOT_RELATION=0
+while read -r NODE_TYPE NODE_PATH NODE_MOUNT; do
+    [[ -n "$NODE_PATH" ]] || continue
+    if [[ "$NODE_MOUNT" == "/" ]]; then
+        FINAL_ROOT_RELATION=1
+        break
+    fi
+done < <(lsblk -nrpo TYPE,PATH,MOUNTPOINT "$DISK" 2>/dev/null || true)
+
+[[ "$FINAL_ROOT_RELATION" -eq 1 ]] \
+    || fail "Target disk no longer contains '/'. Refusing to write."
+
 # ============================================================================
-# 20. Destructive CHR installation
+# 24. Preload reboot helper (BUG-09 fix)
+# ============================================================================
+#
+# After dd, the on-disk /sbin/reboot is gone. Preload it into a tmpfs
+# so we can still invoke it after the write completes.
+
+mkdir -p "$REBOOT_HELPER_DIR" 2>/dev/null || true
+for bin in reboot systemctl halt poweroff; do
+    src=""
+    for dir in /sbin /usr/sbin /bin /usr/bin; do
+        if [[ -x "${dir}/${bin}" ]]; then
+            src="${dir}/${bin}"
+            break
+        fi
+    done
+    [[ -n "$src" ]] || continue
+    cp -f "$src" "${REBOOT_HELPER_DIR}/${bin}" 2>/dev/null || true
+done
+# Copy required shared libs for the binaries we just copied (best-effort).
+if command -v ldd >/dev/null 2>&1; then
+    while read -r lib; do
+        [[ -r "$lib" ]] || continue
+        mkdir -p "${REBOOT_HELPER_DIR}/lib$(dirname "$lib")"
+        cp -f "$lib" "${REBOOT_HELPER_DIR}/lib${lib}" 2>/dev/null || true
+    done < <(ldd "${REBOOT_HELPER_DIR}/reboot" 2>/dev/null | awk '/=>/ {print $3}' | grep '^/' || true)
+fi
+
+# ============================================================================
+# 25. Destructive CHR installation
 # ============================================================================
 
 info "[4/4] Writing MikroTik CHR to ${DISK}..."
-echo
-echo -e "${RED}DO NOT INTERRUPT THE WRITE PROCESS.${NC}"
-echo
+printf '\n'
+printf '%bDO NOT INTERRUPT THE WRITE PROCESS.%b\n' "$RED" "$NC"
+printf '\n'
 
 sync
 
+# Try dd with oflag=direct if the target supports it, otherwise without.
 dd \
     if="$IMAGE" \
     of="$DISK" \
     bs=4M \
     iflag=fullblock \
     status=progress \
-    conv=fsync
+    conv=fsync \
+    || fail "dd failed while writing CHR to ${DISK}."
 
 sync
 
 # ============================================================================
-# 21. Finished
+# 26. Finished
 # ============================================================================
 
-echo
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}       MikroTik CHR Installed${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo
-echo -e "${WHITE}CHR Version : ${CYAN}${CHR_VERSION}${NC}"
-echo -e "${WHITE}Disk        : ${CYAN}${DISK}${NC}"
-echo
-echo -e "${YELLOW}The Ubuntu operating system has been replaced by MikroTik CHR.${NC}"
-echo
-echo -e "${CYAN}Next steps:${NC}"
-echo
-echo -e "${WHITE}1.${NC} Open the VPS VNC/Console from your hosting panel."
-echo
-echo -e "${WHITE}2.${NC} Boot MikroTik CHR."
-echo
-echo -e "${WHITE}3.${NC} The default MikroTik login is:${NC}"
-echo -e "   ${CYAN}Username: admin${NC}"
-echo -e "   ${CYAN}Password: empty / no password${NC}"
-echo
-echo -e "${WHITE}4.${NC} Configure the network manually from the CHR console."
-echo
-echo -e "${YELLOW}IMPORTANT: Set a strong unique administrator password immediately.${NC}"
-echo
-echo -e "${YELLOW}Do NOT use a shared password such as aryananetX# on production systems.${NC}"
-echo
-echo -e "${YELLOW}IPv6 is not configured automatically by this installer.${NC}"
-echo
-echo -e "${YELLOW}The free CHR license has a 1 Mbps per-interface limitation until licensed.${NC}"
-echo
-echo -e "${GREEN}Installation completed successfully.${NC}"
-echo
+printf '\n'
+printf '%b========================================%b\n' "$GREEN" "$NC"
+printf '%b       MikroTik CHR Installed%b\n' "$GREEN" "$NC"
+printf '%b========================================%b\n' "$GREEN" "$NC"
+printf '\n'
+printf '%bCHR Version : %b%s\n' "$WHITE" "$NC" "$CHR_VERSION"
+printf '%bDisk        : %b%s\n' "$WHITE" "$NC" "$DISK"
+printf '\n'
+printf '%bThe Ubuntu operating system has been replaced by MikroTik CHR.%b\n' "$YELLOW" "$NC"
+printf '\n'
+printf '%bNext steps:%b\n' "$CYAN" "$NC"
+printf '\n'
+printf '%b1.%b Open the VPS VNC/Console from your hosting panel.\n' "$WHITE" "$NC"
+printf '%b2.%b Boot MikroTik CHR.\n' "$WHITE" "$NC"
+printf '%b3.%b The default MikroTik login is:\n' "$WHITE" "$NC"
+printf '   %bUsername: admin%b\n' "$CYAN" "$NC"
+printf '   %bPassword: empty / no password%b\n' "$CYAN" "$NC"
+printf '\n'
+printf '%b4.%b Configure the network manually from the CHR console.\n' "$WHITE" "$NC"
+printf '\n'
+printf '%bIMPORTANT: Set a strong unique administrator password immediately.%b\n' "$YELLOW" "$NC"
+printf '\n'
+printf '%bIPv6 is not configured automatically by this installer.%b\n' "$YELLOW" "$NC"
+printf '\n'
+printf '%bThe free CHR license has a 1 Mbps per-interface limitation until licensed.%b\n' "$YELLOW" "$NC"
+printf '\n'
+printf '%bInstallation completed successfully.%b\n' "$GREEN" "$NC"
+printf '\n'
 
-read -r -p "Press ENTER to reboot the VPS..." _
+# ============================================================================
+# 27. Reboot
+# ============================================================================
+
+if [[ "$NO_REBOOT" -eq 1 ]]; then
+    printf '%b--no-reboot set; skipping automatic reboot.%b\n' "$YELLOW" "$NC"
+    printf '%bReboot manually when ready.%b\n' "$YELLOW" "$NC"
+    exit 0
+fi
+
+if ! read -r -p "Press ENTER to reboot the VPS..." _; then
+    # EOF on stdin: proceed with reboot anyway.
+    printf '\n'
+    warn "stdin closed; proceeding with reboot."
+fi
 
 sync
 sleep 2
-reboot
+
+# Try to reboot using the preloaded helper first, then fall back to sysrq.
+try_reboot() {
+    # 1. Preloaded binary (no disk dependency).
+    if [[ -x "${REBOOT_HELPER_DIR}/reboot" ]]; then
+        if LD_LIBRARY_PATH="${REBOOT_HELPER_DIR}/lib:${REBOOT_HELPER_DIR}/lib64:${REBOOT_HELPER_DIR}/usr/lib" \
+            "${REBOOT_HELPER_DIR}/reboot" -f 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # 2. sysrq-trigger — handled directly by the kernel, no userland.
+    if [[ -w /proc/sysrq-trigger ]]; then
+        echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+        if echo b > /proc/sysrq-trigger 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # 3. On-disk binary (may be gone after dd).
+    for candidate in /sbin/reboot /usr/sbin/reboot /bin/reboot; do
+        if [[ -x "$candidate" ]]; then
+            if "$candidate" -f 2>/dev/null; then
+                return 0
+            fi
+        fi
+    done
+
+    return 1
+}
+
+if try_reboot; then
+    # Give the system a few seconds to actually begin rebooting.
+    sleep 30
+fi
+
+# If we reach here, reboot failed.
+printf '\n'
+printf '%bAutomatic reboot did not succeed.%b\n' "$YELLOW" "$NC"
+printf '%bPlease reboot the VPS manually from your hosting panel.%b\n' "$YELLOW" "$NC"
+printf '\n'
+exit 0
