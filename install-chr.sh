@@ -11,46 +11,8 @@
 #
 # IMPORTANT:
 #   - This script ONLY targets the current VPS guest.
-#   - It never accesses the hypervisor/host or other VMs.
 #   - The final dd operation ERASES the current VPS system disk completely.
 #   - CHR is installed from the official MikroTik RAW image.
-#
-# Changelog v1.2.0:
-#   - ADD: Ubuntu 26.04 support (tested)
-#   - ADD: Cloud provider detection (Hetzner/DO/Vultr/Linode/AWS)
-#   - ADD: Network info "SAVE THIS" report before dd
-#   - ADD: Auto-generated RouterOS post-install script
-#   - ADD: Private-gateway (/32 point-to-point) detection + warning
-#   - ADD: --force-version flag for unsupported Ubuntu versions
-#   - ADD: --dry-run alias for --check-only
-#
-# Changelog v1.1.0:
-#   - FIX BUG-01: infinite loop in ERR trap (IN_FAIL guard)
-#   - FIX BUG-02: pipefail + grep empty result
-#   - FIX BUG-03: network detection fail-without-message
-#   - FIX BUG-04: robust IPv4 validator (regex-based)
-#   - FIX BUG-05: read + set -e interaction
-#   - FIX BUG-06: apt full-upgrade -> apt upgrade
-#   - FIX BUG-07: --check-only no longer mutates the system
-#   - FIX BUG-08: SHA256 auto-verification (hardcoded pin)
-#   - FIX BUG-09: preload reboot binary before dd
-#   - FIX BUG-10: rsync -aHAX instead of cp -R
-#   - FIX BUG-12: udevadm settle after modprobe nbd
-#   - FIX BUG-13: full arg parsing loop
-#   - FIX BUG-14: trap installed before arg parsing
-#   - FIX BUG-15: clear only on TTY
-#   - FIX BUG-16: ANSI colors only on TTY
-#   - FIX BUG-17: printf instead of echo -e
-#   - FIX BUG-18: timestamped error logs
-#   - FIX BUG-19: FSTYPE check before readlink
-#   - FIX BUG-20: /dev/root resolution
-#   - FIX BUG-21,22: removed dead code
-#   - FIX BUG-23: PKNAME /dev prefix stripping
-#   - FIX BUG-24: flock-based single-instance lock
-#   - FIX BUG-25: explicit || INTERFACE="" on subshells
-#   - FIX BUG-40: check /tmp free space
-#   - FIX BUG-41: NEEDRESTART_MODE=a
-#   - FIX BUG-58: removed reference to specific password
 #
 
 set -Eeuo pipefail
@@ -73,12 +35,16 @@ readonly CHR_FILE="chr-${CHR_VERSION}.img.zip"
 readonly CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
 readonly CHR_INFO_URL="https://mikrotik.com/download/chr"
 
-# Pinned SHA256. Update when CHR_VERSION changes.
-# "UNSET" disables auto-verification (falls back to manual).
+# ---------------------------------------------------------------------------
+# Pinned SHA256 for the CHR archive.
+#
+# Set this to the official MikroTik checksum for ${CHR_VERSION} to enable
+# automatic verification. If left as "UNSET", the installer will show the
+# computed checksum and ask the user to verify manually.
+# ---------------------------------------------------------------------------
 readonly DEFAULT_EXPECTED_SHA256="UNSET"
 EXPECTED_SHA256="${ARYANANET_CHR_SHA256:-$DEFAULT_EXPECTED_SHA256}"
 
-# Ubuntu versions known to work.
 readonly SUPPORTED_UBUNTU_VERSIONS=("20.04" "22.04" "24.04" "26.04")
 
 readonly MIN_RAM_MB=256
@@ -110,18 +76,12 @@ Options:
                             write to the target disk. Safe mode.
   --no-reboot               Do not automatically reboot after installation.
   --skip-upgrade            Skip 'apt-get upgrade' (still installs packages).
-  --force-version           Bypass the Ubuntu version check. Use with caution.
+  --force-version           Bypass the Ubuntu version check.
   --version                 Print script version and exit.
   --help, -h                Print this help and exit.
 
 Environment variables:
-  ARYANANET_CHR_SHA256   Override the expected SHA256 checksum of the CHR
-                         archive.
-
-Examples:
-  $(basename "$0") --check-only
-  $(basename "$0") --no-reboot
-  $(basename "$0") --check-only --skip-upgrade
+  ARYANANET_CHR_SHA256   Override the expected SHA256 checksum.
 
 WARNING:
   Without --check-only, this script will COMPLETELY ERASE the current system
@@ -153,7 +113,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unexpected positional argument: '$1'" >&2
-            echo "Try '$(basename "$0") --help' for usage." >&2
             exit 2
             ;;
     esac
@@ -362,8 +321,7 @@ done
 
 if [[ "$VERSION_SUPPORTED" -eq 0 ]]; then
     if [[ "$FORCE_VERSION" -eq 1 ]]; then
-        warn "Ubuntu ${VERSION_ID:-unknown} is not in the tested list, but --force-version was given."
-        warn "Continuing at your own risk."
+        warn "Ubuntu ${VERSION_ID:-unknown} not in tested list, but --force-version given."
     else
         fail "Unsupported Ubuntu version '${VERSION_ID:-unknown}'. Supported: ${SUPPORTED_UBUNTU_VERSIONS[*]}. Use --force-version to override."
     fi
@@ -421,32 +379,28 @@ fi
 PROVIDER="unknown"
 
 detect_provider() {
-    # DMI data (most reliable for cloud)
     local dmi_vendor dmi_product
     dmi_vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
     dmi_product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
 
     case "${dmi_vendor,,}${dmi_product,,}" in
-        *hetzner*)              PROVIDER="hetzner" ;;
-        *digitalocean*|*digital_ocean*) PROVIDER="digitalocean" ;;
-        *vultr*)                PROVIDER="vultr" ;;
-        *linode*|*akamai*)      PROVIDER="linode" ;;
-        *amazon*|*aws*)         PROVIDER="aws" ;;
-        *google*|*gce*)         PROVIDER="gcp" ;;
-        *microsoft*|*azure*)    PROVIDER="azure" ;;
-        *ovh*)                  PROVIDER="ovh" ;;
-        *scaleway*)             PROVIDER="scaleway" ;;
-        *oracle*)               PROVIDER="oracle" ;;
-        *contabo*)              PROVIDER="contabo" ;;
+        *hetzner*)                       PROVIDER="hetzner" ;;
+        *digitalocean*|*digital_ocean*)  PROVIDER="digitalocean" ;;
+        *vultr*)                         PROVIDER="vultr" ;;
+        *linode*|*akamai*)               PROVIDER="linode" ;;
+        *amazon*|*aws*)                  PROVIDER="aws" ;;
+        *google*|*gce*)                  PROVIDER="gcp" ;;
+        *microsoft*|*azure*)             PROVIDER="azure" ;;
+        *ovh*)                           PROVIDER="ovh" ;;
+        *scaleway*)                      PROVIDER="scaleway" ;;
+        *oracle*)                        PROVIDER="oracle" ;;
+        *contabo*)                       PROVIDER="contabo" ;;
     esac
 
-    # Fallback: metadata service reachability (optional, no fail on timeout)
-    if [[ "$PROVIDER" == "unknown" ]]; then
-        if command -v curl >/dev/null 2>&1; then
-            if curl -s --max-time 2 -o /dev/null -w '%{http_code}' \
-                http://169.254.169.254/hetzner/v1/metadata 2>/dev/null | grep -q '^[24]'; then
-                PROVIDER="hetzner"
-            fi
+    if [[ "$PROVIDER" == "unknown" ]] && command -v curl >/dev/null 2>&1; then
+        if curl -s --max-time 2 -o /dev/null -w '%{http_code}' \
+            http://169.254.169.254/hetzner/v1/metadata 2>/dev/null | grep -q '^[24]'; then
+            PROVIDER="hetzner"
         fi
     fi
 }
@@ -712,7 +666,6 @@ if (( PREFIX < 1 || PREFIX > 32 )); then
     fail "Detected prefix '/$PREFIX' is out of range."
 fi
 
-# Detect private gateway (point-to-point /32 setups — common on cloud providers)
 GATEWAY_IS_PRIVATE=0
 GW_FIRST_OCTET="${GATEWAY%%.*}"
 if (( GW_FIRST_OCTET == 10 )) \
@@ -733,7 +686,7 @@ fi
 warn "IPv4 is auto-detected. IPv6 is NOT configured by this installer."
 
 # ============================================================================
-# 15. Collect interface MAC (for reference)
+# 15. Collect interface MAC
 # ============================================================================
 
 INTERFACE_MAC=""
@@ -749,8 +702,6 @@ POST_INSTALL_DIR="/tmp/aryananet-chr-post"
 mkdir -p "$POST_INSTALL_DIR" 2>/dev/null || true
 POST_INSTALL_SCRIPT="${POST_INSTALL_DIR}/chr-post-install.rsc"
 
-# Infer CHR interface name from MAC (MikroTik enumerates ether1, ether2, ...)
-# We can't be 100% sure, but most CHR installs on a single-NIC VPS will use ether1.
 CHR_IFACE="ether1"
 
 {
@@ -837,7 +788,7 @@ printf '%bCHR Version        : %b%s%b\n' "$WHITE" "$GREEN" "$CHR_VERSION" "$NC"
 printf '\n'
 
 # ============================================================================
-# 18. CHECK-ONLY early summary + network info display
+# 18. CHECK-ONLY early exit
 # ============================================================================
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
@@ -851,16 +802,16 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     printf '\n'
     printf '%bYou will need these values to configure CHR after installation:%b\n' "$WHITE" "$NC"
     printf '\n'
+    printf '%b  Provider  : %b%s\n' "$WHITE" "$GREEN" "$PROVIDER"
     printf '%b  IPv4      : %b%s/%s\n' "$WHITE" "$GREEN" "$IPV4" "$PREFIX"
     printf '%b  Gateway   : %b%s\n' "$WHITE" "$GREEN" "$GATEWAY"
     printf '%b  Interface : %b%s\n' "$WHITE" "$GREEN" "$INTERFACE"
     printf '%b  MAC       : %b%s\n' "$WHITE" "$GREEN" "${INTERFACE_MAC:-unknown}"
-    printf '%b  Provider  : %b%s\n' "$WHITE" "$GREEN" "$PROVIDER"
     printf '\n'
     printf '%bA pre-generated RouterOS script has been written to:%b\n' "$WHITE" "$NC"
     printf '%b  %s%b\n' "$CYAN" "$POST_INSTALL_SCRIPT" "$NC"
     printf '\n'
-    printf '%bCopy it somewhere safe now (it will be lost after installation):%b\n' "$WHITE" "$NC"
+    printf '%bCopy it somewhere safe now:%b\n' "$WHITE" "$NC"
     printf '%b  cat %s%b\n' "$CYAN" "$POST_INSTALL_SCRIPT" "$NC"
     printf '\n'
 
@@ -874,7 +825,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
 fi
 
 # ============================================================================
-# 19. First warning
+# 19. First confirmation
 # ============================================================================
 
 printf '%b========================================%b\n' "$RED" "$NC"
@@ -900,7 +851,7 @@ if [[ "$CONFIRM" != "YES" ]]; then
 fi
 
 # ============================================================================
-# 20. Pre-download URL check
+# 20. Download URL check
 # ============================================================================
 
 info "Verifying CHR download URL is reachable..."
@@ -1125,7 +1076,7 @@ else
 fi
 
 # ============================================================================
-# 25. Image-vs-disk size check
+# 25. Image size check
 # ============================================================================
 
 if (( IMAGE_SIZE_BYTES > DISK_SIZE_BYTES )); then
@@ -1135,7 +1086,7 @@ fi
 info "CHR image fits inside target disk — OK"
 
 # ============================================================================
-# 26. SAVE THIS — Critical network info before destructive write
+# 26. SAVE THIS — before destructive write
 # ============================================================================
 
 printf '\n'
@@ -1144,7 +1095,7 @@ printf '%b   SAVE THIS NETWORK INFORMATION!%b\n' "$MAGENTA" "$NC"
 printf '%b========================================%b\n' "$MAGENTA" "$NC"
 printf '\n'
 printf '%bAfter the VPS reboots into CHR, you will NOT have shell access.%b\n' "$YELLOW" "$NC"
-printf '%bYou will need the following values to configure CHR via its console:%b\n' "$WHITE" "$NC"
+printf '%bYou will need these values to configure CHR via its console:%b\n' "$WHITE" "$NC"
 printf '\n'
 printf '%b  Provider  : %b%s\n' "$WHITE" "$GREEN" "$PROVIDER"
 printf '%b  IPv4      : %b%s/%s\n' "$WHITE" "$GREEN" "$IPV4" "$PREFIX"
@@ -1153,7 +1104,7 @@ printf '%b  Interface : %b%s\n' "$WHITE" "$GREEN" "$INTERFACE"
 printf '%b  MAC       : %b%s\n' "$WHITE" "$GREEN" "${INTERFACE_MAC:-unknown}"
 printf '\n'
 
-printf '%bA pre-generated RouterOS script has been created for you:%b\n' "$WHITE" "$NC"
+printf '%bA pre-generated RouterOS script has been created:%b\n' "$WHITE" "$NC"
 printf '%b  %s%b\n' "$CYAN" "$POST_INSTALL_SCRIPT" "$NC"
 printf '\n'
 printf '%bReview it now and copy it to your local machine:%b\n' "$WHITE" "$NC"
@@ -1173,7 +1124,7 @@ if [[ "$SAVED_CONFIRM" != "SAVED" ]]; then
 fi
 
 # ============================================================================
-# 27. Final destructive confirmation
+# 27. Final confirmation
 # ============================================================================
 
 printf '\n'
@@ -1200,7 +1151,7 @@ if [[ "$FINAL_CONFIRM" != "INSTALL" ]]; then
 fi
 
 # ============================================================================
-# 28. Re-check target
+# 28. Final disk re-check
 # ============================================================================
 
 info "Performing final disk safety checks..."
@@ -1275,7 +1226,7 @@ dd \
 sync
 
 # ============================================================================
-# 31. Finished
+# 31. Success
 # ============================================================================
 
 printf '\n'
