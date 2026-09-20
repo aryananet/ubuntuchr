@@ -27,6 +27,10 @@ CHR_INFO_URL="https://mikrotik.com/download/chr"
 
 SUPPORTED_UBUNTU_VERSIONS=("20.04" "22.04" "24.04" "26.04")
 
+# UEFI preparation has been validated for this exact CHR release.
+# Fail closed for other releases until their image has been tested.
+UEFI_VALIDATED_CHR_VERSIONS=("7.23.5")
+
 MIN_RAM_MB=256
 RECOMMENDED_RAM_MB=1024
 
@@ -139,6 +143,17 @@ case "${1:-}" in
         fail "Unknown argument '$1'. Supported argument: --check-only"
         ;;
 esac
+
+uefi_version_is_validated() {
+    local version="$1"
+    local item
+
+    for item in "${UEFI_VALIDATED_CHR_VERSIONS[@]}"; do
+        [[ "$version" == "$item" ]] && return 0
+    done
+
+    return 1
+}
 
 # ============================================================================
 # Cleanup
@@ -277,6 +292,12 @@ else
     info "Boot mode: legacy BIOS — OK"
 fi
 
+if [[ "$BOOT_MODE" == "UEFI" ]]; then
+    uefi_version_is_validated "$CHR_VERSION" \
+        || fail "UEFI installation is not enabled for CHR ${CHR_VERSION}. Only validated releases are allowed: ${UEFI_VALIDATED_CHR_VERSIONS[*]}."
+    info "UEFI CHR release ${CHR_VERSION} — validated"
+fi
+
 # ============================================================================
 # 5. Update Ubuntu and install prerequisites
 # ============================================================================
@@ -307,6 +328,7 @@ apt-get install -y --no-install-recommends \
     wget \
     dosfstools \
     qemu-utils \
+    gdisk \
     kmod \
     || fail "Failed to install required packages."
 
@@ -323,6 +345,7 @@ REQUIRED_COMMANDS=(
     file
     find
     findmnt
+    gdisk
     gzip
     grep
     ip
@@ -330,6 +353,7 @@ REQUIRED_COMMANDS=(
     mkfs.fat
     modprobe
     mount
+    qemu-img
     qemu-nbd
     readlink
     sha256sum
@@ -753,21 +777,35 @@ info "CHR RAW image size: ${IMAGE_SIZE_MB} MiB"
 # 16a. UEFI preparation
 # ============================================================================
 #
-# Standard x86 CHR RAW images contain the EFI boot files in partition 1, but
-# that partition uses ext2 rather than a FAT filesystem. UEFI firmware expects
-# a FAT-formatted EFI System Partition. The conversion below changes ONLY the
-# downloaded image in $WORKDIR; the real target disk is not touched here.
+# Standard x86 CHR RAW images are hybrid GPT/MBR images. The first partition
+# contains the x86 EFI loader but is formatted as ext2, so standard UEFI cannot
+# read it. For UEFI we create a tested FAT16 boot filesystem AND rebuild the
+# hybrid MBR/GPT metadata required by MikroTik's EFI loader.
 #
-# This intentionally follows the "no-gdisk" style conversion documented by
-# the fat-chr project: preserve partition 1 files, format partition 1 as FAT,
-# restore the files, and keep the existing partition table unchanged.
-# The existing CHR partition layout is intentionally preserved; only the
-# filesystem on partition 1 is converted to FAT16 for UEFI compatibility.
+# IMPORTANT:
+#   - Only the downloaded temporary image is modified here.
+#   - The real target disk is NOT touched until the final dd stage.
+#   - The partition boundaries are preserved; we do not add/move partitions.
+#
+# The hybrid-MBR part follows the known CHR 7.15+ UEFI method documented by
+# the MikroTik community/fat-chr project: GPT partition 1 is EF00, partition 2
+# is 8300, and the hybrid MBR exposes partitions 1 and 2 as type 0x83 with the
+# first one marked bootable. This is important because some CHR BOOTX64.EFI
+# builds rely on the legacy MBR view to locate the RouterOS partition.
 #
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     info "Preparing CHR image for UEFI boot..."
 
     mkdir -p "$UEFI_MOUNT_DIR" "$UEFI_BACKUP_DIR"
+
+    # Work on a qcow2 working copy. This is the same image-building technique
+    # used by the fat-chr tooling and avoids making partition-table/filesystem
+    # edits directly against the original downloaded file.
+    UEFI_QCOW2="${WORKDIR}/chr-uefi.qcow2"
+    UEFI_RAW_FINAL="${WORKDIR}/chr-uefi.raw"
+
+    qemu-img convert -f raw -O qcow2 "$IMAGE" "$UEFI_QCOW2" \
+        || fail "Failed to create temporary qcow2 image for UEFI preparation."
 
     modprobe nbd max_part=8 \
         || fail "Could not load the Linux nbd module required for UEFI image preparation."
@@ -784,46 +822,30 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     [[ -n "$NBD_DEV" ]] \
         || fail "Could not find a free NBD device for UEFI image preparation."
 
-    qemu-nbd --connect="$NBD_DEV" --format=raw "$IMAGE" \
-        || fail "Failed to attach CHR image to NBD device '${NBD_DEV}'."
+    qemu-nbd --connect="$NBD_DEV" --format=qcow2 "$UEFI_QCOW2" \
+        || fail "Failed to attach temporary CHR UEFI image to NBD device '${NBD_DEV}'."
 
     udevadm settle 2>/dev/null || true
-    sleep 1
+    sleep 2
 
     EFI_PART="${NBD_DEV}p1"
+    ROS_PART="${NBD_DEV}p2"
 
     [[ -b "$EFI_PART" ]] \
         || fail "UEFI preparation failed: boot partition '${EFI_PART}' was not detected."
+    [[ -b "$ROS_PART" ]] \
+        || fail "UEFI preparation failed: RouterOS partition '${ROS_PART}' was not detected."
 
     EFI_FSTYPE="$(blkid -o value -s TYPE "$EFI_PART" 2>/dev/null || true)"
-    EFI_PARTTYPE="$(blkid -o value -s PART_ENTRY_TYPE "$EFI_PART" 2>/dev/null || true)"
 
     info "Original CHR boot partition filesystem: ${EFI_FSTYPE:-unknown}"
-    info "CHR boot partition GPT type: ${EFI_PARTTYPE:-unavailable}"
 
-    # IMPORTANT:
-    # CHR x86 uses a hybrid GPT/MBR layout. On some kernel/NBD combinations
-    # blkid cannot expose PART_ENTRY_TYPE for the attached raw image and returns
-    # an empty value. An unavailable GPT type is therefore NOT treated as an
-    # error. If a GPT type is available and explicitly wrong, we still abort.
-    EXPECTED_ESP_GUID="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
-
-    if [[ -n "$EFI_PARTTYPE" ]]; then
-        [[ "${EFI_PARTTYPE,,}" == "$EXPECTED_ESP_GUID" ]] \
-            || fail "UEFI preparation refused: CHR partition 1 has unexpected GPT type '${EFI_PARTTYPE}'."
-    else
-        warn "GPT partition type was not reported by blkid; validating partition 1 by filesystem and EFI bootloader contents instead."
-    fi
-
-    # Validate partition 1 by its actual contents:
-    #   1. it is the expected ext2 boot filesystem;
-    #   2. it mounts successfully read-only;
-    #   3. it contains the x86 UEFI bootloader BOOTX64.EFI.
     [[ "${EFI_FSTYPE,,}" == "ext2" ]] \
         || fail "UEFI preparation refused: CHR partition 1 is not the expected ext2 boot filesystem (detected '${EFI_FSTYPE:-unknown}')."
 
+    # Read-only validation of the original boot partition.
     mount -o ro "$EFI_PART" "$UEFI_MOUNT_DIR" \
-        || fail "Failed to mount the original CHR boot partition."
+        || fail "Failed to mount the original CHR boot partition read-only."
 
     BOOT_FILE="$(find "$UEFI_MOUNT_DIR" -type f \
         \( -path '*/EFI/BOOT/BOOTX64.EFI' -o -iname 'bootx64.efi' \) \
@@ -832,7 +854,7 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     [[ -n "$BOOT_FILE" ]] \
         || fail "The CHR boot partition does not contain a detectable x86 EFI bootloader."
 
-    cp -R "$UEFI_MOUNT_DIR/." "$UEFI_BACKUP_DIR/" \
+    cp -a "$UEFI_MOUNT_DIR/." "$UEFI_BACKUP_DIR/" \
         || fail "Failed to preserve the original CHR boot files before FAT conversion."
 
     umount "$UEFI_MOUNT_DIR" \
@@ -846,7 +868,7 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
     mount "$EFI_PART" "$UEFI_MOUNT_DIR" \
         || fail "Failed to mount the new FAT16 boot partition."
 
-    cp -R "$UEFI_BACKUP_DIR/." "$UEFI_MOUNT_DIR/" \
+    cp -a "$UEFI_BACKUP_DIR/." "$UEFI_MOUNT_DIR/" \
         || fail "Failed to restore CHR EFI boot files to the FAT16 partition."
 
     sync
@@ -858,32 +880,128 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
         || fail "UEFI bootloader verification failed after FAT16 conversion."
 
     FINAL_EFI_FSTYPE="$(blkid -o value -s TYPE "$EFI_PART" 2>/dev/null || true)"
-    FINAL_EFI_PARTTYPE="$(blkid -o value -s PART_ENTRY_TYPE "$EFI_PART" 2>/dev/null || true)"
-
     [[ "${FINAL_EFI_FSTYPE,,}" == "vfat" ]] \
         || fail "UEFI filesystem verification failed: expected vfat, detected '${FINAL_EFI_FSTYPE:-unknown}'."
 
-    # The partition table is intentionally preserved. If blkid can read the
-    # GPT type, ensure it still matches the EFI System Partition GUID. If the
-    # type remains unavailable, keep the image unchanged and rely on the
-    # verified FAT filesystem + BOOTX64.EFI checks.
-    if [[ -n "$FINAL_EFI_PARTTYPE" ]]; then
-        [[ "${FINAL_EFI_PARTTYPE,,}" == "$EXPECTED_ESP_GUID" ]] \
-            || fail "UEFI partition verification failed: partition 1 has unexpected GPT type '${FINAL_EFI_PARTTYPE}'."
-    else
-        warn "Final GPT partition type is not exposed by blkid; FAT filesystem and EFI bootloader checks passed."
+    umount "$UEFI_MOUNT_DIR" \
+        || fail "Failed to unmount the prepared UEFI boot partition before partition-table repair."
+
+    # ------------------------------------------------------------------------
+    # Rebuild the CHR hybrid GPT/MBR metadata for UEFI.
+    # ------------------------------------------------------------------------
+    #
+    # This is intentionally done with gdisk rather than ad-hoc byte patches.
+    # CHR images since 7.15 use overlapping/hybrid metadata, so the known
+    # jaclaz/fat-chr transformation is used to relocate the backup GPT, rebuild
+    # the GPT from the image's MBR, mark partition 1 EFI (EF00), preserve the
+    # RouterOS partition, and rebuild a hybrid MBR containing p1 + p2 as 0x83.
+    #
+    info "Repairing CHR hybrid GPT/MBR metadata for UEFI..."
+
+    if ! gdisk "$NBD_DEV" >"${WORKDIR}/gdisk-pre.txt" 2>&1 <<'GDISK_INPUT'
+2
+x
+e
+r
+f
+y
+x
+a
+1
+2
+
+m
+t
+1
+EF00
+c
+1
+RouterOS Boot
+c
+2
+RouterOS
+x
+r
+h
+1 2
+n
+83
+y
+83
+n
+n
+w
+y
+GDISK_INPUT
+    then
+        fail "gdisk failed while rebuilding the CHR hybrid GPT/MBR metadata. See ${WORKDIR}/gdisk-pre.txt."
     fi
 
-    # CHR's hybrid partition table is deliberately not rewritten here because
-    # its BIOS bootloader uses fixed layout/offset assumptions.
+    sync
 
-    umount "$UEFI_MOUNT_DIR" \
-        || fail "Failed to unmount the prepared UEFI boot partition."
+    GPT_REPORT="$(gdisk -l "$NBD_DEV" 2>&1 || true)"
+    printf '%s\n' "$GPT_REPORT" > "${WORKDIR}/gdisk-post.txt"
+
+    grep -qi 'MBR: hybrid' <<< "$GPT_REPORT" \
+        || fail "UEFI preparation failed: gdisk did not produce a hybrid MBR."
+
+    grep -Eq '^[[:space:]]*1[[:space:]].*EF00[[:space:]]' <<< "$GPT_REPORT" \
+        || fail "UEFI preparation failed: GPT partition 1 is not EF00 / EFI System Partition."
+
+    grep -Eq '^[[:space:]]*2[[:space:]].*8300[[:space:]]' <<< "$GPT_REPORT" \
+        || fail "UEFI preparation failed: GPT partition 2 is not 8300 / Linux filesystem."
+
+    # Verify GPT consistency after gdisk's transformation.
+    GPT_VERIFY="$(gdisk -v "$NBD_DEV" 2>&1 || true)"
+    printf '%s\n' "$GPT_VERIFY" > "${WORKDIR}/gdisk-verify.txt"
+
+    grep -qi 'No problems found' <<< "$GPT_VERIFY" \
+        || fail "UEFI preparation failed: GPT verification did not report a clean table."
+
+    # Re-validate the final FAT filesystem and EFI loader after all metadata
+    # changes, using the kernel's view of the image.
+    FINAL_EFI_FSTYPE="$(blkid -o value -s TYPE "$EFI_PART" 2>/dev/null || true)"
+    [[ "${FINAL_EFI_FSTYPE,,}" == "vfat" ]] \
+        || fail "UEFI preparation failed: final boot filesystem is not vfat."
+
+    mount "$EFI_PART" "$UEFI_MOUNT_DIR" \
+        || fail "Failed to mount final UEFI boot partition for verification."
+
+    RESTORED_BOOT_FILE="$(find "$UEFI_MOUNT_DIR" -type f \
+        -path '*/EFI/BOOT/BOOTX64.EFI' -print -quit 2>/dev/null || true)"
+
+    [[ -n "$RESTORED_BOOT_FILE" ]] \
+        || fail "UEFI preparation failed: final FAT partition does not contain EFI/BOOT/BOOTX64.EFI."
 
     sync
+    umount "$UEFI_MOUNT_DIR" \
+        || fail "Failed to unmount final UEFI boot partition after verification."
+
     qemu-nbd --disconnect "$NBD_DEV" >/dev/null \
-        || fail "Failed to disconnect the prepared CHR image from NBD."
+        || fail "Failed to disconnect temporary CHR UEFI image."
     NBD_DEV=""
+
+    # Materialize the repaired qcow2 back into the RAW image format expected by
+    # the final dd stage.
+    info "Converting repaired UEFI image back to RAW..."
+
+    qemu-img convert -f qcow2 -O raw "$UEFI_QCOW2" "$UEFI_RAW_FINAL" \
+        || fail "Failed to convert repaired UEFI image back to RAW format."
+
+    [[ -s "$UEFI_RAW_FINAL" ]] \
+        || fail "Repaired UEFI RAW image is empty."
+
+    FINAL_RAW_SIZE_BYTES="$(stat -c%s "$UEFI_RAW_FINAL" 2>/dev/null || echo 0)"
+
+    [[ "$FINAL_RAW_SIZE_BYTES" -eq "$IMAGE_SIZE_BYTES" ]] \
+        || fail "UEFI RAW image size changed unexpectedly (${FINAL_RAW_SIZE_BYTES} vs ${IMAGE_SIZE_BYTES} bytes)."
+
+    mv -f "$UEFI_RAW_FINAL" "$IMAGE" \
+        || fail "Failed to replace the working CHR image with the repaired UEFI RAW image."
+
+    # Recalculate the final image size for the last safety check.
+    IMAGE_SIZE_BYTES="$(stat -c%s "$IMAGE" 2>/dev/null || echo 0)"
+    IMAGE_SIZE_MB=$((IMAGE_SIZE_BYTES / 1024 / 1024))
 
     info "UEFI-compatible CHR image preparation — OK"
 else
