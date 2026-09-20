@@ -563,25 +563,31 @@ echo -e "${WHITE}CHR Version        : ${GREEN}${CHR_VERSION}${NC}"
 echo -e "${WHITE}CHR Preparation    : ${GREEN}${BOOT_MODE}${NC}"
 echo
 
-echo -e "${RED}========================================${NC}"
-echo -e "${RED}                 WARNING${NC}"
-echo -e "${RED}========================================${NC}"
-echo
-echo -e "${YELLOW}THIS OPERATION WILL COMPLETELY ERASE:${NC}"
-echo -e "${YELLOW}  ${DISK}${NC}"
-echo
-echo -e "${YELLOW}The current Ubuntu operating system, files,${NC}"
-echo -e "${YELLOW}partitions and all data on that disk will be destroyed.${NC}"
-echo
-echo -e "${RED}This operation cannot be undone.${NC}"
-echo
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    echo -e "${CYAN}CHECK-ONLY mode enabled.${NC}"
+    echo -e "${YELLOW}The target disk will not be modified in this mode.${NC}"
+    echo
+else
+    echo -e "${RED}========================================${NC}"
+    echo -e "${RED}                 WARNING${NC}"
+    echo -e "${RED}========================================${NC}"
+    echo
+    echo -e "${YELLOW}THIS OPERATION WILL COMPLETELY ERASE:${NC}"
+    echo -e "${YELLOW}  ${DISK}${NC}"
+    echo
+    echo -e "${YELLOW}The current Ubuntu operating system, files,${NC}"
+    echo -e "${YELLOW}partitions and all data on that disk will be destroyed.${NC}"
+    echo
+    echo -e "${RED}This operation cannot be undone.${NC}"
+    echo
 
-read -r -p "Type YES to continue: " CONFIRM
+    read -r -p "Type YES to continue: " CONFIRM
 
-[[ "$CONFIRM" == "YES" ]] || {
-    echo -e "${YELLOW}Installation cancelled. The current system was not modified.${NC}"
-    exit 0
-}
+    [[ "$CONFIRM" == "YES" ]] || {
+        echo -e "${YELLOW}Installation cancelled. The current system was not modified.${NC}"
+        exit 0
+    }
+fi
 
 # ============================================================================
 # 14. Download
@@ -642,12 +648,17 @@ echo
 echo -e "${CYAN}${CHR_INFO_URL}${NC}"
 echo
 
-read -r -p "Type YES after verifying the checksum: " CONFIRM2
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    echo -e "${CYAN}CHECK-ONLY mode: checksum is shown above; continuing without disk write.${NC}"
+    echo
+else
+    read -r -p "Type YES after verifying the checksum: " CONFIRM2
 
-[[ "$CONFIRM2" == "YES" ]] || {
-    echo -e "${YELLOW}Installation cancelled. No disk write was performed.${NC}"
-    exit 0
-}
+    [[ "$CONFIRM2" == "YES" ]] || {
+        echo -e "${YELLOW}Installation cancelled. No disk write was performed.${NC}"
+        exit 0
+    }
+fi
 
 # ============================================================================
 # 16. Extract RAW image
@@ -819,6 +830,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo -e "${WHITE}Target disk   :${NC} ${GREEN}${DISK}${NC}"
     echo
     echo -e "${YELLOW}No destructive disk write was performed.${NC}"
+    echo -e "${YELLOW}The target disk ${DISK} was not modified.${NC}"
     echo -e "${YELLOW}The VPS remains on Ubuntu.${NC}"
     echo
     exit 0
