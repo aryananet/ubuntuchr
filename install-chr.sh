@@ -33,9 +33,51 @@ RECOMMENDED_RAM_MB=1024
 # ============================================================================
 # Temporary working directory
 # ============================================================================
+#
+# Every run starts from a clean temporary project directory. Stale workdirs
+# from previous failed/cancelled runs are removed automatically, while an
+# actively running installer is preserved.
+# ============================================================================
+
+STALE_WORKDIR_PREFIX="/tmp/aryananet-chr."
+ERROR_LOGFILE="/tmp/aryananet-chr-last-error.log"
+
+cleanup_stale_workdirs() {
+    local dir pid pidfile
+
+    shopt -s nullglob
+    for dir in "${STALE_WORKDIR_PREFIX}"*; do
+        [[ -d "$dir" ]] || continue
+
+        pidfile="${dir}/.pid"
+
+        if [[ -r "$pidfile" ]]; then
+            pid="$(cat "$pidfile" 2>/dev/null || true)"
+
+            if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+                printf 'Existing installer process %s is still using %s; preserving it.\n' "$pid" "$dir"
+                continue
+            fi
+
+            rm -rf -- "$dir" 2>/dev/null || true
+            continue
+        fi
+
+        # Workdirs created by older versions had no PID file. Only remove
+        # those that are clearly stale (older than 5 minutes).
+        if find "$dir" -maxdepth 0 -mmin +5 -print -quit 2>/dev/null | grep -q .; then
+            rm -rf -- "$dir" 2>/dev/null || true
+        fi
+    done
+    shopt -u nullglob
+}
+
+# Start from a clean state before creating the new run directory.
+cleanup_stale_workdirs
 
 WORKDIR="$(mktemp -d /tmp/aryananet-chr.XXXXXXXX)"
 LOGFILE="${WORKDIR}/install.log"
+printf '%s\n' "$$" > "${WORKDIR}/.pid"
 
 # ============================================================================
 # Colors
@@ -78,7 +120,10 @@ fail() {
 
     log "FAIL" "$reason"
 
-    echo -e "${CYAN}Diagnostic log: ${LOGFILE}${NC}"
+    # Preserve the diagnostic log outside the temporary project directory;
+    # the workdir itself is removed so the next run truly starts from scratch.
+    cp -f "$LOGFILE" "$ERROR_LOGFILE" 2>/dev/null || true
+    echo -e "${CYAN}Diagnostic log: ${ERROR_LOGFILE}${NC}"
     exit 1
 }
 
@@ -96,28 +141,6 @@ case "${1:-}" in
 esac
 
 # ============================================================================
-# Interactive input helper
-# ============================================================================
-#
-# IMPORTANT: the installer is commonly started like this:
-#
-#   curl -fsSL .../install-chr.sh | sudo bash
-#
-# In that case bash receives the script itself from stdin. A normal `read`
-# therefore reads EOF from the curl pipe instead of reading the user's answer
-# from the terminal, which caused the installer to cancel immediately.
-# All interactive confirmations must explicitly read from /dev/tty.
-#
-read_tty() {
-    local prompt_text="$1"
-    local variable_name="$2"
-
-    [[ -e /dev/tty ]] || fail "Interactive terminal '/dev/tty' is unavailable."
-
-    read -r -p "$prompt_text" "$variable_name" </dev/tty
-}
-
-# ============================================================================
 # Cleanup
 # ============================================================================
 
@@ -127,6 +150,8 @@ UEFI_MOUNT_DIR="${WORKDIR}/uefi-mount"
 UEFI_BACKUP_DIR="${WORKDIR}/uefi-backup"
 
 cleanup() {
+    local status=$?
+
     if [[ -d "${UEFI_MOUNT_DIR:-}" ]]; then
         umount "${UEFI_MOUNT_DIR}" 2>/dev/null || true
     fi
@@ -140,10 +165,11 @@ cleanup() {
         losetup -d "$LOOP_DEV" 2>/dev/null || true
     fi
 
-    rm -f \
-        "${WORKDIR}/${CHR_FILE}" \
-        "${WORKDIR}/chr.img" \
-        2>/dev/null || true
+    # Remove the entire temporary project, not just the downloaded files.
+    # This guarantees that every new execution starts completely fresh.
+    rm -rf -- "${WORKDIR}" 2>/dev/null || true
+
+    return "$status"
 }
 
 trap cleanup EXIT
@@ -603,7 +629,7 @@ else
     echo -e "${RED}This operation cannot be undone.${NC}"
     echo
 
-    read_tty "Type YES to continue: " CONFIRM
+    read -r -p "Type YES to continue: " CONFIRM
 
     [[ "$CONFIRM" == "YES" ]] || {
         echo -e "${YELLOW}Installation cancelled. The current system was not modified.${NC}"
@@ -674,7 +700,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo -e "${CYAN}CHECK-ONLY mode: checksum is shown above; continuing without disk write.${NC}"
     echo
 else
-    read_tty "Type YES after verifying the checksum: " CONFIRM2
+    read -r -p "Type YES after verifying the checksum: " CONFIRM2
 
     [[ "$CONFIRM2" == "YES" ]] || {
         echo -e "${YELLOW}Installation cancelled. No disk write was performed.${NC}"
@@ -909,7 +935,7 @@ echo -e "${RED}The next command will overwrite ${DISK}.${NC}"
 echo -e "${RED}Ubuntu will be destroyed permanently.${NC}"
 echo
 
-read_tty "Type INSTALL to start writing CHR: " FINAL_CONFIRM
+read -r -p "Type INSTALL to start writing CHR: " FINAL_CONFIRM
 
 [[ "$FINAL_CONFIRM" == "INSTALL" ]] || {
     echo -e "${YELLOW}Installation cancelled. No destructive write was performed.${NC}"
@@ -993,7 +1019,7 @@ echo
 echo -e "${GREEN}Installation completed successfully.${NC}"
 echo
 
-read_tty "Press ENTER to reboot the VPS..." _
+read -r -p "Press ENTER to reboot the VPS..." _
 
 sync
 sleep 2
