@@ -21,16 +21,9 @@ umask 077
 # ============================================================================
 
 CHR_VERSION="7.23.5"
-
-# Default to the Legacy BIOS image so CHR_FILE/CHR_URL are always defined
-# for cleanup/error handling even if the script aborts before boot-mode detection.
-CHR_FILE="chr-${CHR_VERSION}-legacy-bios.img.zip"
+CHR_FILE="chr-${CHR_VERSION}.img.zip"
 CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
 CHR_INFO_URL="https://mikrotik.com/download/chr"
-
-# MikroTik publishes separate official x86 CHR RAW images for UEFI and Legacy BIOS.
-# UEFI   -> chr-${CHR_VERSION}.img.zip
-# Legacy -> chr-${CHR_VERSION}-legacy-bios.img.zip
 
 SUPPORTED_UBUNTU_VERSIONS=("20.04" "22.04" "24.04" "26.04")
 
@@ -89,13 +82,37 @@ fail() {
     exit 1
 }
 
+CHECK_ONLY=0
+case "${1:-}" in
+    "")
+        ;;
+    "--check-only")
+        CHECK_ONLY=1
+        ;;
+    *)
+        fail "Unknown argument '$1'. Supported argument: --check-only"
+        ;;
+esac
+
 # ============================================================================
 # Cleanup
 # ============================================================================
 
 LOOP_DEV=""
+NBD_DEV=""
+UEFI_MOUNT_DIR="${WORKDIR}/uefi-mount"
+UEFI_BACKUP_DIR="${WORKDIR}/uefi-backup"
 
 cleanup() {
+    if [[ -d "${UEFI_MOUNT_DIR:-}" ]]; then
+        umount "${UEFI_MOUNT_DIR}" 2>/dev/null || true
+    fi
+
+    if [[ -n "${NBD_DEV:-}" ]]; then
+        qemu-nbd --disconnect "${NBD_DEV}" >/dev/null 2>&1 || true
+        NBD_DEV=""
+    fi
+
     if [[ -n "${LOOP_DEV:-}" ]]; then
         losetup -d "$LOOP_DEV" 2>/dev/null || true
     fi
@@ -205,16 +222,10 @@ info "Virtualization: ${VIRT_TYPE} — OK"
 
 if [[ -d /sys/firmware/efi ]]; then
     BOOT_MODE="UEFI"
-    CHR_FILE="chr-${CHR_VERSION}.img.zip"
-    CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
     info "Boot mode: UEFI — OK"
-    info "CHR image: UEFI RAW image — OK"
 else
     BOOT_MODE="Legacy BIOS"
-    CHR_FILE="chr-${CHR_VERSION}-legacy-bios.img.zip"
-    CHR_URL="https://download.mikrotik.com/routeros/${CHR_VERSION}/${CHR_FILE}"
-    info "Boot mode: Legacy BIOS — OK"
-    info "CHR image: Legacy BIOS RAW image — OK"
+    info "Boot mode: legacy BIOS — OK"
 fi
 
 # ============================================================================
@@ -245,6 +256,10 @@ apt-get install -y --no-install-recommends \
     util-linux \
     unzip \
     wget \
+    dosfstools \
+    gdisk \
+    qemu-utils \
+    kmod \
     || fail "Failed to install required packages."
 
 # ============================================================================
@@ -253,18 +268,26 @@ apt-get install -y --no-install-recommends \
 
 REQUIRED_COMMANDS=(
     awk
+    blkid
     blockdev
+    cp
     dd
     file
+    find
     findmnt
     gzip
     ip
     lsblk
+    modprobe
     mount
+    mkfs.fat
+    qemu-nbd
     readlink
     sha256sum
+    sgdisk
     stat
     sync
+    udevadm
     umount
     unzip
     wget
@@ -530,7 +553,6 @@ echo -e "${WHITE}Ubuntu             : ${GREEN}${VERSION_ID}${NC}"
 echo -e "${WHITE}Architecture       : ${GREEN}${ARCH}${NC}"
 echo -e "${WHITE}Virtualization     : ${GREEN}${VIRT_TYPE}${NC}"
 echo -e "${WHITE}Boot mode          : ${GREEN}${BOOT_MODE}${NC}"
-echo -e "${WHITE}CHR Image          : ${GREEN}${CHR_FILE}${NC}"
 echo -e "${WHITE}Network Interface  : ${GREEN}${INTERFACE}${NC}"
 echo -e "${WHITE}IPv4               : ${GREEN}${IPV4}/${PREFIX}${NC}"
 echo -e "${WHITE}Gateway            : ${GREEN}${GATEWAY}${NC}"
@@ -538,6 +560,7 @@ echo -e "${WHITE}Target Disk        : ${GREEN}${DISK}${NC}"
 echo -e "${WHITE}Disk Size          : ${GREEN}${DISK_SIZE_MB} MiB${NC}"
 echo -e "${WHITE}RAM                : ${GREEN}${RAM_MB} MiB${NC}"
 echo -e "${WHITE}CHR Version        : ${GREEN}${CHR_VERSION}${NC}"
+echo -e "${WHITE}CHR Preparation    : ${GREEN}${BOOT_MODE}${NC}"
 echo
 
 echo -e "${RED}========================================${NC}"
@@ -630,24 +653,15 @@ read -r -p "Type YES after verifying the checksum: " CONFIRM2
 # 16. Extract RAW image
 # ============================================================================
 
-info "[3/4] Extracting ${BOOT_MODE} MikroTik CHR RAW image..."
+info "[3/4] Extracting CHR RAW image..."
 
 #
-# FIX: the downloaded archive is a ZIP file (verified above with `file`
-# and `unzip -t`), not a gzip stream. The previous version of this script
-# incorrectly called `gunzip` here, which always failed on a ZIP file and
-# aborted the installer before it could ever reach the disk-write step.
-#
-# We now extract with `unzip`, find the single .img member inside the
-# archive (MikroTik ships exactly one RAW image per release), and verify
-# it explicitly instead of assuming a fixed filename.
+# The downloaded archive is a ZIP file. Extract the single .img member and
+# validate it before doing anything destructive.
 #
 
 IMAGE="${WORKDIR}/chr.img"
-
-IMAGE_MEMBER="$(
-    unzip -Z1 "$CHR_FILE" 2>/dev/null | grep -i '\.img$' | head -n1
-)"
+IMAGE_MEMBER="$({ unzip -Z1 "$CHR_FILE" 2>/dev/null || true; } | grep -i '\.img$' | head -n1)"
 
 [[ -n "$IMAGE_MEMBER" ]] \
     || fail "Could not find a .img file inside the downloaded ZIP archive."
@@ -668,7 +682,124 @@ IMAGE_SIZE_MB=$((IMAGE_SIZE_BYTES / 1024 / 1024))
 info "CHR RAW image size: ${IMAGE_SIZE_MB} MiB"
 
 # ============================================================================
-# 17. Critical image-vs-disk safety check
+# 16a. UEFI preparation
+# ============================================================================
+
+if [[ "$BOOT_MODE" == "UEFI" ]]; then
+
+    # Standard x86 CHR RAW images use a non-FAT boot partition. UEFI firmware
+    # expects the EFI System Partition to contain a FAT filesystem. We prepare
+    # a COPY of the downloaded CHR image only; the real target disk is never
+    # touched during this conversion.
+    #
+    # This follows the same general conversion used by the fat-chr project:
+    # preserve the RouterOS boot files, recreate partition 1 as FAT, restore
+    # the boot files, and ensure partition 1 is marked as an EFI System
+    # Partition in GPT.
+
+    info "Preparing CHR image for UEFI boot..."
+
+    mkdir -p "$UEFI_MOUNT_DIR" "$UEFI_BACKUP_DIR"
+
+    modprobe nbd max_part=8 \
+        || fail "Could not load the Linux nbd module required for UEFI image preparation."
+
+    for candidate in /dev/nbd*; do
+        [[ -b "$candidate" ]] || continue
+        candidate_size="$(blockdev --getsize64 "$candidate" 2>/dev/null || echo 0)"
+        if [[ "$candidate_size" == "0" ]]; then
+            NBD_DEV="$candidate"
+            break
+        fi
+    done
+
+    [[ -n "$NBD_DEV" ]] \
+        || fail "Could not find a free NBD device for UEFI image preparation."
+
+    qemu-nbd --connect="$NBD_DEV" --format=raw "$IMAGE" \
+        || fail "Failed to attach CHR image to NBD device '${NBD_DEV}'."
+
+    udevadm settle 2>/dev/null || true
+    sleep 1
+
+    EFI_PART="${NBD_DEV}p1"
+    ROOT_PART="${NBD_DEV}p2"
+
+    [[ -b "$EFI_PART" ]] \
+        || fail "UEFI preparation failed: boot partition '${EFI_PART}' was not detected."
+
+    [[ -b "$ROOT_PART" ]] \
+        || fail "UEFI preparation failed: RouterOS root partition '${ROOT_PART}' was not detected."
+
+    EFI_FSTYPE="$(blkid -o value -s TYPE "$EFI_PART" 2>/dev/null || true)"
+    info "Original CHR boot partition filesystem: ${EFI_FSTYPE:-unknown}"
+
+    mount -o ro "$EFI_PART" "$UEFI_MOUNT_DIR" \
+        || fail "Failed to mount the original CHR boot partition."
+
+    BOOT_FILE="$(find "$UEFI_MOUNT_DIR" -type f \
+        \( -iname 'bootx64.efi' -o -iname 'grubx64.efi' -o -iname 'bootia32.efi' \) \
+        -print -quit 2>/dev/null || true)"
+
+    [[ -n "$BOOT_FILE" ]] \
+        || fail "The CHR boot partition does not contain a detectable EFI bootloader."
+
+    cp -R "$UEFI_MOUNT_DIR/." "$UEFI_BACKUP_DIR/" \
+        || fail "Failed to preserve the original CHR boot files before FAT conversion."
+
+    umount "$UEFI_MOUNT_DIR" \
+        || fail "Failed to unmount the original CHR boot partition."
+
+    info "Converting CHR boot partition to FAT16 for UEFI..."
+
+    mkfs.fat -F 16 "$EFI_PART" >/dev/null \
+        || fail "Failed to create FAT16 filesystem on the CHR boot partition."
+
+    mount "$EFI_PART" "$UEFI_MOUNT_DIR" \
+        || fail "Failed to mount the new FAT16 boot partition."
+
+    cp -R "$UEFI_BACKUP_DIR/." "$UEFI_MOUNT_DIR/" \
+        || fail "Failed to restore CHR EFI boot files to the FAT16 partition."
+
+    sync
+
+    RESTORED_BOOT_FILE="$(find "$UEFI_MOUNT_DIR" -type f -iname 'bootx64.efi' -print -quit 2>/dev/null || true)"
+
+    [[ -n "$RESTORED_BOOT_FILE" ]] \
+        || fail "UEFI bootloader verification failed after FAT conversion."
+
+    umount "$UEFI_MOUNT_DIR" \
+        || fail "Failed to unmount the prepared UEFI boot partition."
+
+    sync
+    qemu-nbd --disconnect "$NBD_DEV" >/dev/null \
+        || fail "Failed to disconnect the prepared CHR image from NBD."
+    NBD_DEV=""
+
+    # Verify that a valid GPT exists and make absolutely sure partition 1 is
+    # typed as an EFI System Partition. We intentionally do not rebuild the
+    # whole partition table here; only the image file is modified.
+    GPT_INFO="$(sgdisk -i 1 "$IMAGE" 2>&1 || true)"
+
+    grep -qi 'Partition GUID code:[[:space:]]*EF00' <<< "$GPT_INFO" || {
+        info "Marking CHR partition 1 as an EFI System Partition..."
+        sgdisk -t 1:EF00 -c 1:'RouterOS Boot' "$IMAGE" >/dev/null \
+            || fail "Could not mark CHR partition 1 as an EFI System Partition."
+    }
+
+    GPT_INFO_FINAL="$(sgdisk -i 1 "$IMAGE" 2>&1 || true)"
+
+    grep -qi 'Partition GUID code:[[:space:]]*EF00' <<< "$GPT_INFO_FINAL" \
+        || fail "UEFI image verification failed: partition 1 is not marked as EFI System Partition."
+
+    info "UEFI-compatible CHR image preparation — OK"
+
+else
+    info "Legacy BIOS detected — using the official CHR RAW image unchanged."
+fi
+
+# ============================================================================
+# 16b. Final image-vs-disk size check
 # ============================================================================
 
 if (( IMAGE_SIZE_BYTES > DISK_SIZE_BYTES )); then
@@ -676,6 +807,26 @@ if (( IMAGE_SIZE_BYTES > DISK_SIZE_BYTES )); then
 fi
 
 info "CHR image fits inside target disk — OK"
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    echo
+    echo -e "${GREEN}========================================${NC}"
+    echo -e "${GREEN}          CHECK-ONLY COMPLETED${NC}"
+    echo -e "${GREEN}========================================${NC}"
+    echo
+    echo -e "${WHITE}Boot mode     :${NC} ${GREEN}${BOOT_MODE}${NC}"
+    echo -e "${WHITE}CHR image     :${NC} ${GREEN}${IMAGE_SIZE_MB} MiB${NC}"
+    echo -e "${WHITE}Target disk   :${NC} ${GREEN}${DISK}${NC}"
+    echo
+    echo -e "${YELLOW}No destructive disk write was performed.${NC}"
+    echo -e "${YELLOW}The VPS remains on Ubuntu.${NC}"
+    echo
+    exit 0
+fi
+
+# ============================================================================
+# 17. Critical image-vs-disk safety check
+# ============================================================================
 
 # ============================================================================
 # 18. Final pre-write verification
@@ -688,7 +839,7 @@ echo -e "${RED}========================================${NC}"
 echo
 echo -e "${WHITE}Target disk:${NC} ${GREEN}${DISK}${NC}"
 echo -e "${WHITE}Disk size  :${NC} ${GREEN}${DISK_SIZE_MB} MiB${NC}"
-echo -e "${WHITE}CHR image  :${NC} ${GREEN}${IMAGE_SIZE_MB} MiB${NC}"
+echo -e "${WHITE}CHR image  :${NC} ${GREEN}${IMAGE_SIZE_MB} MiB (${BOOT_MODE})${NC}"
 echo -e "${WHITE}Network    :${NC} ${GREEN}${IPV4}/${PREFIX} via ${GATEWAY}${NC}"
 echo
 echo -e "${RED}The next command will overwrite ${DISK}.${NC}"
@@ -725,7 +876,7 @@ FINAL_DISK_SIZE="$(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0)"
 # 20. Destructive CHR installation
 # ============================================================================
 
-info "[4/4] Writing MikroTik CHR to ${DISK}..."
+info "[4/4] Writing MikroTik CHR image to ${DISK}..."
 echo
 echo -e "${RED}DO NOT INTERRUPT THE WRITE PROCESS.${NC}"
 echo
